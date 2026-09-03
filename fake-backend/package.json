@@ -1,0 +1,12 @@
+{
+  "name": "fake-backend",
+  "version": "1.0.0",
+  "description": "Mock chat.deepseek.com UI + scripted response API for MyClaudeCode development",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

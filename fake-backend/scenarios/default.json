@@ -1,0 +1,13 @@
+{
+  "description": "Simple end-to-end scenario: create a file named hello.txt",
+  "planner": [
+    "I'll check the project layout first.\n\n!LS .",
+    "[SUBTASK]Create a file named hello.txt containing the text \"Hello World\"[/SUBTASK]",
+    "[MEMORY_UPDATE]\n- Created hello.txt with a greeting as the first task.\n[/MEMORY_UPDATE]\nALL_DONE Summary: created hello.txt with the requested greeting."
+  ],
+  "executor": [
+    "Understood — ready for the first subtask.",
+    "I'll create the file now.\n\n!WRITE_FILE hello.txt\n\n```text\nHello World\n```",
+    "DONE Created hello.txt with the text \"Hello World\"."
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "my-claude-code-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "MyClaudeCode - Free AI Coding Agent (CLI + native host + Chrome extension + fake backend)",
+  "workspaces": [
+    "cli",
+    "native-host",
+    "fake-backend"
+  ],
+  "scripts": {
+    "mock:server": "npm run start --workspace=fake-backend",
+    "cli": "node cli/index.js",
+    "install-host": "node native-host/install.js"
+  }
+}

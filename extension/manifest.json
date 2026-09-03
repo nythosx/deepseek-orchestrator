@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "MyClaudeCode Agent",
+  "version": "1.0",
+  "description": "Autonomous coding agent via DeepSeek chat.",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "nativeMessaging",
+    "webNavigation",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "http://localhost:8080/*",
+    "https://chat.deepseek.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost:8080/*",
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "lib/streamBridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "http://localhost:8080/*",
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+K"
+      }
+    }
+  },
+  "action": {
+    "default_title": "MyClaudeCode Agent"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxhfd0XegNQxT1E69IDyiZhPM3ezzLd9SwmlmQ0x/3hlfwuptlha+Ki7pV0i45A1stx6DSzV4H+HyOc/hzH4bdI0PJRRHwg76vs2S13U8HRDEKdugNtXw+jorIQ/NGj+cQpF/oE6zD7Zh5mlzGFcw2//GwY5i92XtekExClGpVMVXTeuUT3xfiTTG69FSuBxDFirDW7Ad8gKke1IZ1usDsd588yto7tryB/NkFZma/D29NHQhd5UracCLMUjf1/2e+NGl3VqAv7Vyofud2Fo4VYxpspy0xqPBWw8UtfASDjIelCV1anwNORq7suc6he6J1eDObl0/f7U3x66diRbCkwIDAQAB"
+}

@@ -1,0 +1,14 @@
+{
+  "description": "Planner properly delegates via [SUBTASK] (it can no longer write files directly — see PLANNER_DISALLOWED_TOOLS in orchestrator.js). The executor writes broken.js with a syntax error and prematurely claims DONE without verifying; the executor-level quality gate catches it and forces a real fix before the subtask can complete. The planner's own ALL_DONE gate then re-verifies before the task completes.",
+  "planner": [
+    "[SUBTASK]Create broken.js with a function foo(a, b) that returns a + b. Verify it's valid JavaScript before replying DONE.[/SUBTASK]",
+    "[MEMORY_UPDATE]\n- Created broken.js via the executor.\n[/MEMORY_UPDATE]\nALL_DONE Summary: created broken.js."
+  ],
+  "executor": [
+    "Understood — ready for the first subtask.",
+    "I'll create that file now.\n\n!WRITE_FILE broken.js\n```text\nfunction foo(a, b) {\n  return a + b;\n\n```\n\nDONE Created broken.js.",
+    "DONE",
+    "Oops, that has a syntax error. Let me fix it.\n\n!WRITE_FILE broken.js\n```text\nfunction foo(a, b) {\n  return a + b;\n}\n```\n\nDONE Fixed broken.js.",
+    "DONE"
+  ]
+}

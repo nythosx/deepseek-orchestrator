@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MyClaudeCode — Live Process Log</title>
+<style>
+  :root{
+    --bg:#eef0f3;
+    --surface:#ffffff;
+    --surface-2:#f5f7f9;
+    --text:#1a212b;
+    --text-dim:#5a6472;
+    --text-faint:#8992a0;
+    --border:#dbe0e5;
+    --accent:#3d4fc4;
+    --accent-soft:#e6e8fb;
+    --good:#248a54;
+    --good-soft:#e3f4ea;
+    --warn:#b5790a;
+    --warn-soft:#faedd4;
+    --bad:#c23f34;
+    --bad-soft:#fbe6e3;
+    --rail:#c7cdd4;
+    --note-bg:#fdf6e0;
+    --note-border:#e8d99a;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0e1216; --surface:#161c22; --surface-2:#1b222a; --text:#e7ebef;
+      --text-dim:#95a1ae; --text-faint:#6b7684; --border:#2a333d; --accent:#8894ee;
+      --accent-soft:#242a4a; --good:#4fbb82; --good-soft:#173226; --warn:#e3ab48;
+      --warn-soft:#3a2d10; --bad:#e2685a; --bad-soft:#3a1f1c; --rail:#333d48;
+      --note-bg:#2b260f; --note-border:#4f451c;
+    }
+  }
+  *{box-sizing:border-box;}
+  html,body{ margin:0; }
+  body{
+    background:var(--bg); color:var(--text);
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  @media (prefers-reduced-motion: reduce){ *{ animation-duration:0.001ms !important; transition-duration:0.001ms !important; } }
+  .mono{ font-family: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+
+  header.top{ position:sticky; top:0; z-index:10; background:var(--surface); border-bottom:1px solid var(--border); padding:20px clamp(16px,4vw,40px); }
+  .top-row{ display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+  .eyebrow-row{ display:flex; align-items:center; gap:8px; }
+  .eyebrow{ font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:var(--accent); font-weight:700; }
+  .live-pill{ display:inline-flex; align-items:center; gap:5px; font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:var(--good); background:var(--good-soft); border-radius:99px; padding:2px 8px 2px 6px; }
+  .live-dot{ width:6px; height:6px; border-radius:50%; background:var(--good); animation: blink 1.4s ease-in-out infinite; }
+  .live-pill.stale{ color:var(--bad); background:var(--bad-soft); }
+  .live-pill.stale .live-dot{ background:var(--bad); animation:none; }
+  @keyframes blink{ 0%,100%{opacity:1;} 50%{opacity:0.35;} }
+
+  h1{ font-size:20px; margin:2px 0 0; font-weight:700; letter-spacing:-0.01em; text-wrap:balance; }
+  .subtitle{ font-size:13px; color:var(--text-dim); margin-top:4px; max-width:65ch; }
+
+  .stat-row{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+  .stat{ background:var(--surface-2); border:1px solid var(--border); border-radius:8px; padding:8px 12px; min-width:88px; }
+  .stat .n{ font-size:18px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .stat .l{ font-size:10.5px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.05em; margin-top:1px; }
+  .stat.done .n{ color:var(--good); }
+  .stat.processing .n{ color:var(--accent); }
+  .stat.timeout .n{ color:var(--warn); }
+  .stat.failed .n{ color:var(--bad); }
+
+  main{ max-width:920px; margin:0 auto; padding:28px clamp(16px,4vw,40px) 100px; }
+
+  .session-notes{ background:var(--note-bg); border:1px solid var(--note-border); border-radius:10px; padding:14px 16px; margin-bottom:26px; }
+  .session-notes label{ display:flex; align-items:center; gap:6px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-dim); margin-bottom:8px; }
+  .session-notes textarea{ width:100%; min-height:64px; resize:vertical; border:1px solid var(--note-border); border-radius:6px; background:var(--surface); color:var(--text); font-family:inherit; font-size:13px; padding:8px 10px; line-height:1.5; }
+  .session-notes textarea:focus{ outline:2px solid var(--accent); outline-offset:1px; }
+  .session-notes .hint{ font-size:11px; color:var(--text-faint); margin-top:6px; }
+  .save-flash{ color:var(--good); opacity:0; transition:opacity .2s; margin-left:6px; }
+  .save-flash.show{ opacity:1; }
+
+  .empty{ color:var(--text-faint); font-size:13px; padding:20px 0 20px 44px; }
+
+  ol.log{ list-style:none; margin:0; padding:0; position:relative; }
+  ol.log::before{ content:""; position:absolute; left:15px; top:6px; bottom:6px; width:2px; background:var(--rail); }
+  li.step{ position:relative; padding:0 0 0 44px; margin-bottom:2px; }
+  li.step .node{ position:absolute; left:8px; top:16px; width:16px; height:16px; border-radius:50%; background:var(--surface); border:2px solid var(--rail); z-index:1; }
+  li.step[data-status="done"] .node{ border-color:var(--good); background:var(--good-soft); }
+  li.step[data-status="processing"] .node{ border-color:var(--accent); background:var(--accent-soft); }
+  li.step[data-status="timeout"] .node{ border-color:var(--warn); background:var(--warn-soft); }
+  li.step[data-status="failed"] .node{ border-color:var(--bad); background:var(--bad-soft); }
+  li.step[data-status="processing"] .node::after{ content:""; position:absolute; inset:-6px; border-radius:50%; border:2px solid var(--accent); opacity:0.55; animation: pulse 1.6s ease-out infinite; }
+  @keyframes pulse{ 0%{ transform:scale(0.7); opacity:0.7; } 100%{ transform:scale(1.6); opacity:0; } }
+
+  .card{ background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:11px 14px; margin-bottom:8px; }
+  .card-row{ display:flex; align-items:flex-start; justify-content:space-between; gap:14px; }
+  .card-main{ min-width:0; flex:1; }
+  .step-top{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .badge{ font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; padding:2px 7px; border-radius:99px; white-space:nowrap; }
+  .badge.done{ background:var(--good-soft); color:var(--good); }
+  .badge.processing{ background:var(--accent-soft); color:var(--accent); }
+  .badge.timeout{ background:var(--warn-soft); color:var(--warn); }
+  .badge.failed{ background:var(--bad-soft); color:var(--bad); }
+  .role-tag{ font-size:10px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-faint); border:1px solid var(--border); border-radius:4px; padding:1px 5px; }
+  .label{ font-size:13.5px; font-weight:600; margin-top:5px; text-wrap:balance; }
+  .detail{ font-size:12px; color:var(--text-dim); margin-top:4px; white-space:pre-wrap; word-break:break-word; max-width:62ch; }
+  .seq{ color:var(--text-faint); font-size:11px; margin-right:6px; }
+  .dur{ flex-shrink:0; text-align:right; font-size:12.5px; font-variant-numeric:tabular-nums; color:var(--text-dim); padding-top:2px; }
+  .dur .ms{ font-weight:700; color:var(--text); }
+  .dur.slow .ms{ color:var(--warn); }
+  .dur.veryslow .ms{ color:var(--bad); }
+
+  .note-toggle{ background:none; border:none; color:var(--text-faint); font-size:11px; cursor:pointer; padding:6px 0 0; display:flex; align-items:center; gap:4px; font-family:inherit; }
+  .note-toggle:hover{ color:var(--accent); }
+  .note-toggle .dot{ width:5px; height:5px; border-radius:50%; background:var(--accent); display:none; }
+  .note-toggle.has-note .dot{ display:inline-block; }
+  .note-toggle.has-note{ color:var(--accent); }
+  .card-note{ display:none; margin-top:8px; }
+  .card-note.open{ display:block; }
+  .card-note textarea{ width:100%; min-height:44px; resize:vertical; border:1px solid var(--border); border-radius:6px; background:var(--surface-2); color:var(--text); font-family:inherit; font-size:12.5px; padding:7px 9px; line-height:1.5; }
+  .card-note textarea:focus{ outline:2px solid var(--accent); outline-offset:1px; }
+
+  .followbar{ position:fixed; right:24px; bottom:24px; }
+  .followbar button{ background:var(--accent); color:#fff; border:none; border-radius:99px; padding:9px 16px; font-size:12.5px; font-weight:700; cursor:pointer; box-shadow:0 4px 14px rgba(0,0,0,0.2); }
+  .followbar button[disabled]{ opacity:0; pointer-events:none; }
+
+  footer{ max-width:920px; margin:0 auto; padding:0 clamp(16px,4vw,40px) 60px; color:var(--text-faint); font-size:12px; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-row">
+    <div>
+      <div class="eyebrow-row">
+        <div class="eyebrow">Process Log</div>
+        <span class="live-pill" id="livePill"><span class="live-dot"></span><span id="liveText">connecting…</span></span>
+      </div>
+      <h1>MyClaudeCode Agent — Live Process Log</h1>
+      <div class="subtitle">Every granular action the agent takes, in order, as it happens: typing into DeepSeek, waiting for a reply, running a shell command, reading the plan. Oldest at top, most recent at the bottom.</div>
+    </div>
+  </div>
+  <div class="stat-row" id="statRow"></div>
+</header>
+
+<main>
+  <div class="session-notes">
+    <label for="sessionNoteInput">Your notes on this run <span class="save-flash" id="sessionSaveFlash">saved</span></label>
+    <textarea id="sessionNoteInput" placeholder="Write general observations here while you watch DeepSeek and the project side by side — e.g. mismatches between what this page claims and what you actually see."></textarea>
+    <div class="hint">Saved in this browser only. Survives reloads of this tab.</div>
+  </div>
+
+  <div id="emptyState" class="empty">Waiting for the agent to start…</div>
+  <ol class="log" id="log"></ol>
+</main>
+
+<footer>Task ID: <span class="mono" id="taskId">—</span></footer>
+
+<div class="followbar"><button id="followBtn" disabled>↓ Jump to latest</button></div>
+
+<script>
+/*__STEP_REDUCER__*/
+</script>
+<script>
+  let state = createStepState();
+  const logEl = document.getElementById('log');
+  const emptyEl = document.getElementById('emptyState');
+  const statRow = document.getElementById('statRow');
+  const taskIdEl = document.getElementById('taskId');
+  const livePill = document.getElementById('livePill');
+  const liveText = document.getElementById('liveText');
+  const followBtn = document.getElementById('followBtn');
+
+  const esc = s => (s == null ? '' : String(s)).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fmtMs = ms => {
+    if (ms == null) return '—';
+    if (ms < 1000) return ms + ' ms';
+    const s = ms / 1000;
+    if (s < 60) return s.toFixed(1) + ' s';
+    const m = Math.floor(s / 60), rs = Math.round(s % 60);
+    return `${m}m ${rs}s`;
+  };
+  const durClass = ms => ms == null ? '' : ms > 60000 ? 'veryslow' : ms > 10000 ? 'slow' : '';
+  const roleWho = r => ({planner:'Planner tab', executor:'Executor tab', system:'System'}[r] || r);
+  const STATUS_WORD = { done:'Done', processing:'Processing', timeout:'Timed out', failed:'Failed' };
+
+  let notesNS = null; // set once we know the taskId
+  function nsFor(seq) { return (notesNS || 'mcc-notes:pending') + ':step:' + seq; }
+
+  function wireNoteControls(root) {
+    root.querySelectorAll('.note-toggle').forEach(btn => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = '1';
+      const seq = btn.dataset.seq;
+      const wrap = root.querySelector(`.card-note[data-seq-note="${seq}"]`);
+      const input = wrap.querySelector('textarea');
+      const key = nsFor(seq);
+      const existing = localStorage.getItem(key) || '';
+      if (existing) {
+        input.value = existing;
+        wrap.classList.add('open');
+        btn.classList.add('has-note');
+        btn.querySelector('.label-text').textContent = 'Note';
+      }
+      btn.addEventListener('click', () => {
+        wrap.classList.toggle('open');
+        if (wrap.classList.contains('open')) input.focus();
+      });
+      let t = null;
+      input.addEventListener('input', () => {
+        clearTimeout(t);
+        t = setTimeout(() => {
+          if (input.value.trim()) {
+            localStorage.setItem(key, input.value);
+            btn.classList.add('has-note');
+            btn.querySelector('.label-text').textContent = 'Note';
+          } else {
+            localStorage.removeItem(key);
+            btn.classList.remove('has-note');
+            btn.querySelector('.label-text').textContent = '+ Add note';
+          }
+        }, 400);
+      });
+    });
+  }
+
+  function stepHTML(st) {
+    return `
+      <li class="step" data-status="${st.status}" data-seq="${st.seq}">
+        <div class="node"></div>
+        <div class="card">
+          <div class="card-row">
+            <div class="card-main">
+              <div class="step-top">
+                <span class="badge ${st.status}">${STATUS_WORD[st.status] || st.status}</span>
+                ${st.role && st.role !== 'system' ? `<span class="role-tag">${esc(roleWho(st.role))}</span>` : ''}
+              </div>
+              <div class="label"><span class="seq">#${st.seq}</span>${esc(st.label)}</div>
+              ${st.detail ? `<div class="detail mono">${esc(st.detail)}</div>` : ''}
+            </div>
+            <div class="dur ${durClass(st.durationMs)}">
+              <div class="ms">${st.durationMs == null ? (st.status === 'processing' ? 'in progress' : '—') : fmtMs(st.durationMs)}</div>
+            </div>
+          </div>
+          <button class="note-toggle" data-seq="${st.seq}"><span class="dot"></span><span class="label-text">+ Add note</span></button>
+          <div class="card-note" data-seq-note="${st.seq}">
+            <textarea data-seq-input="${st.seq}" placeholder="Note on step #${st.seq}…"></textarea>
+          </div>
+        </div>
+      </li>`;
+  }
+
+  function isNearBottom() {
+    return window.innerHeight + window.scrollY >= document.body.offsetHeight - 80;
+  }
+
+  function render() {
+    if (notesNS === null && state.taskId) {
+      notesNS = 'mcc-notes:' + state.taskId;
+      taskIdEl.textContent = state.taskId;
+      const sessionInput = document.getElementById('sessionNoteInput');
+      sessionInput.value = localStorage.getItem(notesNS + ':session') || '';
+    }
+
+    if (state.steps.length) emptyEl.style.display = 'none';
+
+    const shouldFollow = isNearBottom();
+    logEl.innerHTML = state.steps.map(stepHTML).join('');
+    wireNoteControls(logEl);
+    if (shouldFollow) window.scrollTo(0, document.body.scrollHeight);
+
+    const s = computeStats(state.steps);
+    statRow.innerHTML = `
+      <div class="stat"><div class="n">${s.totalSteps}</div><div class="l">Total steps</div></div>
+      <div class="stat done"><div class="n">${s.doneSteps}</div><div class="l">Done</div></div>
+      <div class="stat processing"><div class="n">${s.processingSteps}</div><div class="l">Processing</div></div>
+      <div class="stat timeout"><div class="n">${s.timeoutSteps}</div><div class="l">Timed out</div></div>
+      <div class="stat failed"><div class="n">${s.failedSteps}</div><div class="l">Failed</div></div>
+      <div class="stat"><div class="n">${fmtMs(s.totalDurationMs)}</div><div class="l">Total measured time</div></div>
+    `;
+  }
+
+  window.addEventListener('scroll', () => {
+    followBtn.disabled = isNearBottom();
+  });
+  followBtn.addEventListener('click', () => window.scrollTo(0, document.body.scrollHeight));
+
+  const sessionInput = document.getElementById('sessionNoteInput');
+  const sessionFlash = document.getElementById('sessionSaveFlash');
+  let sessionTimer = null;
+  sessionInput.addEventListener('input', () => {
+    clearTimeout(sessionTimer);
+    sessionTimer = setTimeout(() => {
+      if (notesNS) {
+        localStorage.setItem(notesNS + ':session', sessionInput.value);
+        sessionFlash.classList.add('show');
+        setTimeout(() => sessionFlash.classList.remove('show'), 900);
+      }
+    }, 400);
+  });
+
+  // The server replays its full event history to every new connection (see
+  // cli/lib/dashboard/server.js) — including on a reconnect, not just the first connect.
+  // So every (re)connection is rebuilt from scratch here rather than appended to: a frozen
+  // background tab that Chrome silently drops and later resumes, or a plain page reload,
+  // both end up re-deriving the exact current state instead of getting stuck wherever they
+  // last were or duplicating steps on top of stale ones.
+  const es = new EventSource('/events');
+  es.onopen = () => {
+    liveText.textContent = 'live';
+    livePill.classList.remove('stale');
+    state = createStepState();
+    notesNS = null;
+    render();
+  };
+  es.onerror = () => { liveText.textContent = 'reconnecting…'; livePill.classList.add('stale'); };
+  es.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (_) { return; }
+    reduceEvent(state, msg);
+    render();
+  };
+</script>
+</body>
+</html>

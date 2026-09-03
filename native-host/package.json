@@ -1,0 +1,9 @@
+{
+  "name": "my-claude-code-native-host",
+  "version": "1.0.0",
+  "description": "Native messaging host bridging the Chrome extension to the filesystem, shell, and the CLI's WebSocket server",
+  "main": "host.js",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

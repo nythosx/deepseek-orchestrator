@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Mock DeepSeek Chat</title>
+<link rel="stylesheet" href="/chat.css" />
+</head>
+<body>
+  <div id="chat-root" data-role="" data-task-id="">
+    <header id="chat-header">
+      <span id="role-label"></span>
+      <button id="web-search-toggle" data-testid="web-search-toggle" aria-pressed="false" title="Toggle web search">🌐 Web Search</button>
+    </header>
+
+    <div id="messages" data-testid="message-list"></div>
+
+    <footer id="composer">
+      <textarea id="chat-input" data-testid="chat-input" placeholder="Message DeepSeek..."></textarea>
+      <button id="send-btn" data-testid="send-button">Send</button>
+    </footer>
+  </div>
+
+  <script src="/chat.js"></script>
+</body>
+</html>

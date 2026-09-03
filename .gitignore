@@ -1,0 +1,19 @@
+node_modules/
+.myclaudecode/
+native-host/dev-key/
+native-host/com.myclaudecode.host.json
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# local ad-generation projects (Remotion, API keys in .env)
+ads/
+
+# local dev tooling / scratch artifacts, not part of the shipped project
+.claude/
+scratch-*/
+deepseek-page-source.html
+claude-response.md
+.env
+.env.*
