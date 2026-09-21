@@ -83,8 +83,8 @@ The extension drives both DeepSeek chat tabs directly in your real browser sessi
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/Antrax-Inhaler/my-claude-code.git
-cd my-claude-code
+git clone https://github.com/nythosx/deepseek-orchestrator.git
+cd deepseek-orchestrator
 npm install
 npm run install-host
 ```
