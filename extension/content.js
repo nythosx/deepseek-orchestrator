@@ -3,6 +3,30 @@
 // to the background service worker via chrome.runtime.onMessage.
 
 (function () {
+  // Instance guard. tabs.js's recoverContentScript re-injects this file on "Receiving end
+  // does not exist", which can land on a tab that already has a copy:
+  //  - a live copy (the error was a navigation race): bail out, one listener is enough;
+  //  - an orphaned copy left behind by an extension reload, whose chrome.runtime is dead:
+  //    take over, and tell it to stop so its poll loop doesn't keep clicking Continue in
+  //    parallel with ours. (After a reload the new copy may get a fresh isolated world, in
+  //    which case it never sees the flag at all — the superseded event still reaches the
+  //    old one, since both share the DOM.)
+  const runtimeAlive = () => {
+    try {
+      return !!(chrome.runtime && chrome.runtime.id);
+    } catch (_) {
+      return false;
+    }
+  };
+  if (window.__mccContentAlive && window.__mccContentAlive()) return;
+  window.__mccContentAlive = runtimeAlive;
+  document.dispatchEvent(new CustomEvent('mcc:superseded'));
+  let superseded = false;
+  // Registered after our own dispatch above, so we never receive it ourselves.
+  document.addEventListener('mcc:superseded', () => {
+    if (!runtimeAlive()) superseded = true;
+  });
+
   // Cheap injection canary — logs once, immediately, so a "Tab did not become ready" error
   // upstream (tabs.js's waitForReady) can be told apart at a glance: if this line is missing
   // from the tab's console entirely, the content script never ran at all (extension not
@@ -25,6 +49,26 @@
   document.addEventListener('mcc:stream-done', (e) => {
     try { lastStreamDoneAt = JSON.parse(e.detail).ts; } catch (_) { /* ignore malformed bridge event */ }
   });
+
+  // Rate limit (429/503) flag — set by background.js's chrome.webRequest.onCompleted /
+  // onErrorOccurred listeners, read by waitForAssistantSettle's poll loop. Persistent rate
+  // limits can't be waited out from within the tab, so detecting them here (rather than
+  // only via hasRateLimitBanner's DOM fallback, which misses 200-with-error-body cases)
+  // is the primary signal that a fresh tab is needed.
+  let lastRateLimitAt = 0;
+  const RATE_LIMIT_QUIET_MS = 8000;
+  let rateLimitStatusCode = null;
+
+  // Continue-button grace period (Addendum 2 Part I, Bug 1): after clicking Continue,
+  // DeepSeek can take several seconds to emit the next chunk. Without a grace window, the
+  // 1200ms STABLE_MS stabilization path fires during that gap and treats the paused
+  // response as complete — the truncation bug. postContinueGraceMs stretches the required
+  // stable window to 8s after any Continue click.
+  let continueJustClickedAt = 0;
+  // Set by the MutationObserver below — used only as a diagnostic hint (see the poll loop
+  // in waitForAssistantSettle). The actual fix is the grace period; the observer exists
+  // so a future selector-drift bug can be diagnosed without re-adding instrumentation.
+  let continueJustAppearedAt = 0;
 
   const RESPONSE_TIMEOUT_MS = 60000;
   // Once an assistant message's text stops changing for this long, treat it as finished.
@@ -269,6 +313,30 @@
   // paused response sitting there, which desyncs the conversation from what we think
   // happened. Confirmed against real chat.deepseek.com outerHTML.
   function findContinueButton() {
+    // Captured live from chat.deepseek.com (2026-10-25). The Continue button is rendered
+    // as:
+    //   <div role="button" class="ds-button ...ds-button--outlinedNeutral...
+    //        ds-button--capsule ds-button--s ds-button--icon-relative-m
+    //        ds-button--min-width">
+    //     <div class="ds-button__background"></div>
+    //     <div class="ds-button__border"></div>
+    //     <span class="ds-button__content">Continue</span>
+    //   </div>
+    // Matching on the semantic class combo (role=button + .ds-button with a
+    // .ds-button__content child whose trimmed text is exactly "continue") is much less
+    // likely to false-positive than a whole-document text scan — a "Continue" button in
+    // an unrelated UI component, or the word "Continue" appearing in normal message text,
+    // could match the old text-only selector. The text-only fallback below is kept as a
+    // last resort in case DeepSeek's class names drift in a future redesign.
+    let lastMatch = null;
+    const semanticMatches = document.querySelectorAll('[role="button"].ds-button');
+    for (const b of semanticMatches) {
+      const contentSpan = b.querySelector('.ds-button__content');
+      if (contentSpan && (contentSpan.textContent || '').trim().toLowerCase() === 'continue') {
+        lastMatch = b; // keep the LAST match — current-turn button always appears after any stale one
+      }
+    }
+    if (lastMatch) return lastMatch;
     return findButtonByText(document, 'continue');
   }
 
@@ -320,6 +388,288 @@
     el.click();
   }
 
+  // Scrolls an element into view with 'nearest' semantics — a no-op when it's already
+  // visible, a single scroll when it's off-screen. Needed specifically because DeepSeek
+  // renders the Continue button at the very bottom of the response (verified live
+  // 2026-10-25): on a long response, the button can be below the viewport OR below the
+  // fold of a scrollable message container. Synthetic click events usually fire
+  // regardless of visibility, but some frameworks gate click handlers on
+  // getBoundingClientRect visibility or use lazy attachment, and clicks dispatched at
+  // (0,0) coordinates may not hit the intended target on some implementations.
+  // scrollIntoView with { block: 'nearest' } is chosen over { block: 'center' } because
+  // 'nearest' is a no-op when already visible — important since the poll loop may call
+  // this once per tick while a click is in-flight. Best-effort — any failure here just
+  // falls back to the existing behavior, never blocks the click.
+  function scrollIntoViewSafe(el) {
+    if (!el) return;
+    try {
+      el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+    } catch (_) {
+      try {
+        el.scrollIntoView();
+      } catch (_) {
+        // truly best-effort — the click below is still attempted either way
+      }
+    }
+  }
+
+  // Phase 26 (2026-10-25): multi-strategy button activation for Continue/Retry.
+  //
+  // The old robustClick fires a single MouseEvent-based sequence and returns.
+  // Observed live: the Continue button sometimes renders (exact DOM verified
+  // by the user) but doesn't dismiss after our click. Most likely cause:
+  // DeepSeek's handler is bound via React's pointer-event system, which needs
+  // real PointerEvent instances with proper pointerId/pointerType. MouseEvent
+  // typed as 'pointerdown' fails `instanceof PointerEvent` checks inside React
+  // and some libraries.
+  //
+  // Strategy: dispatch every plausible activation, after each one wait a short
+  // window for the button to actually unmount. Stop the moment it's gone. If
+  // all strategies fail, return false so the poll loop counts the attempt and
+  // retries (up to CONTINUE_CLICK_HARD_CAP consecutive failures before error).
+  //
+  // Also: attach a capture listener to document and verify the click event
+  // actually reached the document. If dispatch itself is being swallowed (e.g.
+  // by a pointer-events:none ancestor), we'll know from the log.
+
+  function waitForButtonGone(btn, timeoutMs) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const check = () => {
+        if (!btn || !btn.isConnected || !document.body.contains(btn)) return resolve(true);
+        // Also: if the current findContinueButton/findRetryButton resolves to a
+        // DIFFERENT node, the old one is stale — treat as gone.
+        try {
+          if (findContinueButton() !== btn && findRetryButton() !== btn) {
+            // Confirm neither the button nor a replacement is the same node
+            const current = findContinueButton() || findRetryButton();
+            if (current !== btn) return resolve(true);
+          }
+        } catch (_) {}
+        if (Date.now() - start > timeoutMs) return resolve(false);
+        setTimeout(check, 100);
+      };
+      check();
+    });
+  }
+
+  async function robustActivateButton(btn) {
+    if (!btn || !btn.isConnected) return false;
+    scrollIntoViewSafe(btn);
+    try { btn.focus({ preventScroll: true }); } catch (_) {}
+    await sleep(100);
+
+    const rect = btn.getBoundingClientRect();
+    const cx = Math.round(rect.left + rect.width / 2);
+    const cy = Math.round(rect.top + rect.height / 2);
+
+    // =================================================================
+    // SOLUTION 0: Trusted click via chrome.debugger (background.js)
+    // =================================================================
+    // Every strategy below dispatches isTrusted:false events, which DeepSeek ignores
+    // intermittently. This one asks the service worker to send a real browser-level
+    // click (CDP Input.dispatchMouseEvent) at the button's center — see
+    // lib/trustedInput.js. Runs before the pre-step on purpose: a real click needs no
+    // pointer-events overrides or simulated hover. Falls through to the synthetic
+    // strategies if the debugger can't attach (e.g. DevTools open on this tab).
+    console.log(`[MyClaudeCode] Solution 0: Trusted CDP click at (${cx},${cy})`);
+    for (let i = 0; i < 2; i++) {
+      const r = btn.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      const topEl = document.elementFromPoint(x, y);
+      if (topEl && topEl !== btn && !btn.contains(topEl)) {
+        console.warn('[MyClaudeCode] Solution 0: click point is covered by', topEl.tagName, topEl.className);
+      }
+      let res;
+      try {
+        res = await chrome.runtime.sendMessage({ action: 'trustedClick', x, y });
+      } catch (err) {
+        res = { ok: false, error: err && err.message };
+      }
+      if (!res || !res.ok) {
+        console.warn('[MyClaudeCode] Solution 0 unavailable:', res && res.error);
+        break;
+      }
+      if (await waitForButtonGone(btn, 1000)) {
+        console.log('[MyClaudeCode] Solution 0 SUCCEEDED');
+        return true;
+      }
+      await sleep(300);
+    }
+
+    // ---------------------------------------------------------
+    // PRE-STEP: Force Pointer Events & Simulate Hover
+    // ---------------------------------------------------------
+    console.log(`[MyClaudeCode] Pre-Step: Forcing pointer-events and simulating hover`);
+    try {
+      let curr = btn;
+      while (curr && curr !== document.body) {
+        if (window.getComputedStyle(curr).pointerEvents === 'none') {
+          console.warn('[MyClaudeCode] Overriding pointer-events: none on', curr.tagName, curr.className);
+          curr.style.pointerEvents = 'auto';
+        }
+        curr = curr.parentElement;
+      }
+      
+      const hoverOpts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+      btn.dispatchEvent(new PointerEvent('pointerover', hoverOpts));
+      btn.dispatchEvent(new PointerEvent('pointerenter', hoverOpts));
+      btn.dispatchEvent(new MouseEvent('mouseover', hoverOpts));
+      btn.dispatchEvent(new MouseEvent('mouseenter', hoverOpts));
+      btn.dispatchEvent(new MouseEvent('mousemove', hoverOpts));
+    } catch (_) {}
+    await sleep(150);
+
+    function dispatchMouseSequence(target, x, y) {
+      if (!target) return;
+      const opts = {
+        bubbles: true, cancelable: true, composed: true, view: window,
+        clientX: x, clientY: y, screenX: x, screenY: y, button: 0
+      };
+      try {
+        target.dispatchEvent(new PointerEvent('pointerdown', { ...opts, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 1 }));
+        target.dispatchEvent(new MouseEvent('mousedown', opts));
+        target.dispatchEvent(new PointerEvent('pointerup', { ...opts, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 0 }));
+        target.dispatchEvent(new MouseEvent('mouseup', opts));
+        target.dispatchEvent(new MouseEvent('click', opts));
+      } catch (_) {}
+    }
+
+    // =================================================================
+    // SOLUTION 1: Coordinate-based MouseEvents (3 attempts)
+    // =================================================================
+    console.log(`[MyClaudeCode] Solution 1: Coordinate-based events at (${cx},${cy})`);
+    for (let i = 0; i < 3; i++) {
+      console.log(`[MyClaudeCode] Solution 1 attempt ${i + 1}/3`);
+      dispatchMouseSequence(btn, cx, cy);
+      if (await waitForButtonGone(btn, 600)) {
+        console.log('[MyClaudeCode] Solution 1 SUCCEEDED');
+        return true;
+      }
+      await sleep(300);
+    }
+
+    // =================================================================
+    // SOLUTION 2: Force native click & span click (3 attempts)
+    // =================================================================
+    console.log('[MyClaudeCode] Solution 2: Force native click bypass');
+    for (let i = 0; i < 3; i++) {
+      console.log(`[MyClaudeCode] Solution 2 attempt ${i + 1}/3`);
+      try {
+        if (typeof HTMLElement.prototype.click === 'function') {
+          HTMLElement.prototype.click.call(btn);
+        }
+      } catch (_) {}
+      
+      const span = btn.querySelector('.ds-button__content');
+      if (span) {
+        try { HTMLElement.prototype.click.call(span); } catch (_) {}
+      }
+      
+      if (await waitForButtonGone(btn, 600)) {
+        console.log('[MyClaudeCode] Solution 2 SUCCEEDED');
+        return true;
+      }
+      await sleep(300);
+    }
+
+    // =================================================================
+    // SOLUTION 3: elementFromPoint Overlay Bypass (3 attempts)
+    // =================================================================
+    console.log('[MyClaudeCode] Solution 3: elementFromPoint overlay bypass');
+    for (let i = 0; i < 3; i++) {
+      console.log(`[MyClaudeCode] Solution 3 attempt ${i + 1}/3`);
+      try {
+        const topEl = document.elementFromPoint(cx, cy);
+        if (topEl) {
+          if (topEl !== btn && !btn.contains(topEl) && !topEl.contains(btn)) {
+            console.warn('[MyClaudeCode] Button visually covered by:', topEl.className || topEl.tagName);
+            dispatchMouseSequence(topEl, cx, cy);
+          } else {
+            dispatchMouseSequence(topEl, cx, cy);
+          }
+        }
+      } catch (err) {
+        console.warn('[MyClaudeCode] Solution 3 threw:', err.message);
+      }
+      if (await waitForButtonGone(btn, 600)) {
+        console.log('[MyClaudeCode] Solution 3 SUCCEEDED');
+        return true;
+      }
+      await sleep(300);
+    }
+
+    // =================================================================
+    // SOLUTION 4: React Fiber Injection (The "Hard" Solution)
+    // =================================================================
+    console.log('[MyClaudeCode] Solution 4: React Fiber Injection');
+    for (let i = 0; i < 3; i++) {
+      console.log(`[MyClaudeCode] Solution 4 attempt ${i + 1}/3`);
+      try {
+        // Find React props keys (they look like __reactProps$xyz123)
+        const btnPropsKey = Object.keys(btn).find(k => k.startsWith('__reactProps$'));
+        const span = btn.querySelector('.ds-button__content');
+        const spanPropsKey = span ? Object.keys(span).find(k => k.startsWith('__reactProps$')) : null;
+        
+        const props = btnPropsKey ? btn[btnPropsKey] : (spanPropsKey ? span[spanPropsKey] : null);
+        
+        if (props) {
+          const handlers = ['onClick', 'onPointerUp', 'onMouseUp', 'onPointerDown', 'onMouseDown'];
+          for (const h of handlers) {
+            if (typeof props[h] === 'function') {
+              console.log(`[MyClaudeCode] Firing React prop: ${h}`);
+              const fakeEvent = {
+                nativeEvent: new MouseEvent('click', { bubbles: true, cancelable: true, view: window }),
+                target: btn,
+                currentTarget: btn,
+                preventDefault: () => {},
+                stopPropagation: () => {},
+                isDefaultPrevented: () => false,
+                isPropagationStopped: () => false,
+                persist: () => {},
+                type: 'click',
+                button: 0,
+                buttons: 0,
+                clientX: cx,
+                clientY: cy,
+              };
+              props[h](fakeEvent);
+            }
+          }
+        } else {
+          console.warn('[MyClaudeCode] Could not find React props on button or inner span');
+        }
+      } catch (err) {
+        console.warn('[MyClaudeCode] Solution 4 threw:', err.message);
+      }
+      
+      if (await waitForButtonGone(btn, 600)) {
+        console.log('[MyClaudeCode] Solution 4 SUCCEEDED');
+        return true;
+      }
+      await sleep(300);
+    }
+
+    // =================================================================
+    // FALLBACK: Original keyboard/parent attempts (single try)
+    // =================================================================
+    console.log('[MyClaudeCode] Fallback: Keyboard & parent wrapper');
+    try {
+      const kOpts = { bubbles: true, cancelable: true, composed: true, view: window, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 };
+      btn.dispatchEvent(new KeyboardEvent('keydown', kOpts));
+      btn.dispatchEvent(new KeyboardEvent('keyup', kOpts));
+    } catch (_) {}
+    if (await waitForButtonGone(btn, 500)) return true;
+
+    try {
+      if (btn.parentElement) dispatchMouseSequence(btn.parentElement, cx, cy);
+    } catch (_) {}
+    if (await waitForButtonGone(btn, 500)) return true;
+
+    return false;
+  }
+
   // DeepSeek shows this exact text inline in the chat when its own connection drops
   // mid-response. Observed live: without detecting this explicitly, the system just kept
   // treating the resulting stalled/garbled state as a normal (if slow) response and let the
@@ -338,6 +688,41 @@
     while ((node = walker.nextNode())) {
       if (node.parentElement && node.parentElement.closest('pre, code')) continue;
       if ((node.textContent || '').includes('Check network and retry.')) return true;
+    }
+    return false;
+  }
+
+  // Backup detection for the case where DeepSeek returns 200 with an error body instead
+  // of a 429/503 — the network-layer chrome.webRequest listener in background.js catches
+  // the normal case, but not that one. Same false-positive guards as hasNetworkErrorBanner
+  // and hasLengthLimitReached: scoped away from <pre>/<code> (a diff or command output
+  // that happens to contain the phrase shouldn't trip it) and requiring the containing
+  // element to be visible (a banner left in the DOM from an earlier turn shouldn't either).
+  function hasRateLimitBanner() {
+    const patterns = [
+      /too many requests/i,
+      /rate limit(ed)?/i,
+      /try again (later|in \d+)/i,
+      /please (wait|slow down)/i,
+      // Exact text captured live from chat.deepseek.com (2026-10-25):
+      // <span>Messages too frequent. Try again later.</span>
+      // The /try again later/ pattern above already matches this string, but keeping the
+      // head phrase as its own pattern makes the intent obvious to a future reader and
+      // survives a DeepSeek copy rewrite that drops "try again later" but keeps "too
+      // frequent".
+      /messages too frequent/i,
+    ];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.parentElement && node.parentElement.closest('pre, code')) continue;
+      // DeepSeek's own reply (or the user's prompt) can say "rate limit" / "try again
+      // later" -- only a banner outside the chat bubbles counts.
+      if (node.parentElement && node.parentElement.closest('.ds-message, ' + SELECTORS.assistantMessage)) continue;
+      const text = node.textContent || '';
+      if (patterns.some((re) => re.test(text)) && node.parentElement && isVisibleElement(node.parentElement)) {
+        return true;
+      }
     }
     return false;
   }
@@ -484,8 +869,12 @@
       const continueBtn = findContinueButton();
       const retryBtn = findRetryButton();
       if (!continueBtn && !retryBtn) return;
+      const targetBtn = continueBtn || retryBtn;
       console.log(`[MyClaudeCode] Clearing stuck ${continueBtn ? 'Continue' : 'Retry'} button before sending.`);
-      robustClick(continueBtn || retryBtn);
+      // Phase 26: use the same multi-strategy activation as the poll loop, so
+      // pre-send clearing benefits from the same PointerEvent fix.
+      const dismissed = await robustActivateButton(targetBtn);
+      if (dismissed) return;
       await sleep(delayMs);
     }
   }
@@ -629,6 +1018,35 @@
 
       (function poll() {
         diagnostics.pollTickCount++;
+        if (superseded) {
+          return rejectWithDiagnostics('Content script superseded by a newer injection (extension was reloaded).');
+        }
+        // Persistent rate limit — surface as a specific, migratable rejection rather than
+        // waiting out a full inactivity timeout first. The RATE_LIMIT: prefix is what
+        // lets tabs.js's MIGRATABLE_RE / orchestrator.js's sendAndTrack classify this
+        // specifically (backoff then migrate) instead of treating it as an ordinary
+        // task-ending error.
+        // A reply that is still growing is not rate limited, whatever a stray 429 or
+        // banner says -- only act once the text has been frozen for a few seconds.
+        const stillStreaming = sawAnyText && Date.now() - lastProgressAt < RATE_LIMIT_QUIET_MS;
+        if (lastRateLimitAt > pollStartedAt && !stillStreaming) {
+          return rejectWithDiagnostics(
+            `RATE_LIMIT: DeepSeek returned ${rateLimitStatusCode || 'a rate limit'}. Migrating to a fresh tab may or may not resolve this — the limit may be account-wide.`
+          );
+        }
+        // DOM fallback for rate limits delivered on a 200 status (no 429/503 at the network
+        // layer — see background.js's webRequest listeners for that path). Live capture
+        // from chat.deepseek.com 2026-10-25: `<span>Messages too frequent. Try again
+        // later.</span>` inside a hashed-class wrapper. Terminal for this tab — reject
+        // immediately so the orchestrator's backoff-then-migrate (PhasedMigration.
+        // handleRateLimit) fires instead of waiting out the full 3-minute
+        // INITIAL_RESPONSE_GRACE_MS on a response that is never going to arrive.
+        if (!stillStreaming && hasRateLimitBanner()) {
+          return rejectWithDiagnostics(
+            'RATE_LIMIT: DeepSeek returned "Messages too frequent. Try again later." in the response DOM. ' +
+            'The orchestrator will back off then migrate to a fresh tab.'
+          );
+        }
         if (Date.now() - lastRefocusCheckAt >= REFOCUS_CHECK_INTERVAL_MS) {
           const windowElapsedMs = Date.now() - lastRefocusCheckAt;
           const ticksThisWindow = diagnostics.pollTickCount - ticksAtLastRefocusCheck;
@@ -718,19 +1136,62 @@
             ? findStoppedRetryButton()
             : null;
         if (continueBtn || retryBtn || stoppedRetryBtn) {
+          // Hard click cap: if the button is still present after this many clicks, either
+          // the button is genuinely unresponsive (disabled, handler not attached, behind
+          // an overlay) or the click target isn't working for a reason scrolling can't
+          // fix. Surface a specific error rather than let the poll loop silently spin
+          // through the full 3-minute INITIAL_RESPONSE_GRACE_MS or 10-minute absolute
+          // ceiling — this converts an opaque stall into an actionable message.
+          const CONTINUE_CLICK_HARD_CAP = 40; // 40 clicks * 1500ms delay = 60s of click window
+          if (diagnostics.continueOrRetryClicks >= CONTINUE_CLICK_HARD_CAP) {
+            return rejectWithDiagnostics(
+              `Continue/Retry button still present after ${diagnostics.continueOrRetryClicks} click attempts — DeepSeek is not responding to clicks on this button. The button is rendered but its click handler appears not to be wired, or the click isn't reaching it. Manual intervention in the tab may be required.`
+            );
+          }
           const label = continueBtn ? 'Continue' : retryBtn ? 'Retry' : 'Stopped-badge retry';
-          console.log(`[MyClaudeCode] ${label} button detected, clicking.`);
+          const targetBtn = continueBtn || retryBtn || stoppedRetryBtn;
+          console.log(`[MyClaudeCode] ${label} button detected, activating (multi-strategy).`);
           diagnostics.continueOrRetryClicks++;
-          robustClick(continueBtn || retryBtn || stoppedRetryBtn);
-          // More content is about to stream in — don't let stale stabilization state
-          // resolve early on the text as it stood before the click.
+          // Snapshot the attempt number NOW — robustActivateButton is async and
+          // diagnostics.continueOrRetryClicks could theoretically change if we
+          // re-entered poll during the async window (we don't, but being explicit
+          // is cheap).
+          const thisAttempt = diagnostics.continueOrRetryClicks;
+          // Set all Continue-related state BEFORE kicking off the async activation.
+          // The 8s post-Continue grace (see continueJustClickedAt's declaration)
+          // should count from the click moment, not from whenever
+          // robustActivateButton's 2.3-second worst-case strategy walk completes.
+          // Same for lastText/lastChangeAt/lastProgressAt — resetting them means
+          // the next poll tick treats whatever text is there as "new" regardless
+          // of when the click actually took effect.
+          continueJustClickedAt = Date.now();
           lastText = null;
           lastChangeAt = Date.now();
           lastProgressAt = Date.now();
-          if (Date.now() > absoluteDeadline) {
-            return rejectWithDiagnostics('Timed out waiting for assistant response (absolute ceiling).');
-          }
-          setTimeout(poll, 250);
+          // Phase 26b (2026-10-25): poll is a SYNC function (the original design
+          // relies on setTimeout(poll, ...) from a plain IIFE). The Phase 26 patch
+          // added `await robustActivateButton(...)` here — invalid in sync code,
+          // SyntaxError. Fix: fire the promise and schedule the next poll tick
+          // from inside .then(). Poll stays sync, no race introduced (only one
+          // poll is ever scheduled at a time, same as before).
+          robustActivateButton(targetBtn).then((dismissed) => {
+            console.log(
+              `[MyClaudeCode] ${label} click ${dismissed ? 'succeeded (button dismissed)' : 'did NOT dismiss the button'}` +
+              ` — attempt ${thisAttempt}/${CONTINUE_CLICK_HARD_CAP}`
+            );
+            if (Date.now() > absoluteDeadline) {
+              return rejectWithDiagnostics('Timed out waiting for assistant response (absolute ceiling).');
+            }
+            // Faster re-poll when the click worked (text should start flowing);
+            // slower when it didn't (avoid burning all attempts in seconds).
+            setTimeout(poll, dismissed ? 500 : 1500);
+          }).catch((err) => {
+            // robustActivateButton is internally try/catch'd per strategy, so a
+            // throw here is unexpected (e.g. a botched dispatch). Treat as
+            // not-dismissed and keep polling rather than killing the turn.
+            console.warn('[MyClaudeCode] robustActivateButton threw:', err && err.message);
+            setTimeout(poll, 1500);
+          });
           return;
         }
 
@@ -782,6 +1243,13 @@
               if (text !== lastText) {
                 diagnostics.state = 'streaming';
                 lastText = text;
+                // Phase 20 (2026-10-25): text growth means the previous
+                // Continue click worked. Reset the counter so a long response
+                // needing many Continue cycles doesn't hit the hard cap.
+                // Only UNBROKEN clicking without text growth counts.
+                if (diagnostics.continueOrRetryClicks > 0) {
+                  diagnostics.continueOrRetryClicks = 0;
+                }
                 lastChangeAt = Date.now();
                 lastProgressAt = Date.now();
                 buttonWaitSince = null;
@@ -811,8 +1279,27 @@
                 // never resolve early on its own, it only shortens how long the DOM-quiet
                 // wait needs to be.
                 const streamConfirmedDone = lastStreamDoneAt > pollStartedAt;
-                const requiredStableMs = streamConfirmedDone ? STREAM_CONFIRMED_STABLE_MS : STABLE_MS;
+                // Continue-button grace (see continueJustClickedAt's declaration): force at
+                // least 8000ms of text silence after a Continue click before treating the
+                // response as finished. Without this, a slow-to-resume stream looks
+                // indistinguishable from a genuinely finished one and we resolve on the
+                // pre-Continue text — the truncation bug this fixes.
+                const postContinueGraceMs =
+                  continueJustClickedAt > 0 && Date.now() - continueJustClickedAt < 8000 ? 8000 : 0;
+                const requiredStableMs = streamConfirmedDone
+                  ? STREAM_CONFIRMED_STABLE_MS
+                  : Math.max(STABLE_MS, postContinueGraceMs);
                 const buttonGraceMs = streamConfirmedDone ? STREAM_CONFIRMED_BUTTON_GRACE_MS : BUTTON_READY_GRACE_MS;
+                // Diagnostic only (belt-and-suspenders — see continueJustAppearedAt): if the
+                // MutationObserver saw a Continue button but findContinueButton() didn't,
+                // the selector may have drifted. No control-flow effect either way; the
+                // grace period is the primary fix.
+                if (!diagnostics.continueSelectorMissed && continueJustAppearedAt > pollStartedAt) {
+                  diagnostics.continueSelectorMissed = true;
+                  console.warn(
+                    '[MyClaudeCode] Continue button appeared (observer) but findContinueButton() did not see it — selector may be stale.'
+                  );
+                }
                 // Diagnostic-only (rides along in the TIMING message content.js's caller
                 // already surfaces to the CLI) — added after live testing showed
                 // done_stream_confirmed never firing in real orchestrator runs despite the
@@ -952,7 +1439,147 @@
     throw new Error('Clicking send did not appear to submit the message (input was never cleared) after multiple attempts.');
   }
 
-  async function typeAndSend(text, { instant = false } = {}) {
+  // --- image attachments --------------------------------------------------------------
+  //
+  // Puts image files into DeepSeek's composer without clicking the upload button: builds
+  // real File objects from the base64 the background sent, then tries, in order, a paste
+  // into the chat input (what a user's Ctrl+V does), the page's hidden <input type=file>,
+  // and a drop on the input. Each try is checked by watching the composer for the
+  // attachment to appear; the first one that shows up wins. DeepSeek's attachment chip
+  // markup isn't captured in the repo, so detection is deliberately loose: any new
+  // element outside the chat history that carries the file name, or an attachment-ish
+  // class, or a new <img>.
+  const ATTACH_DETECT_MS = 5000;
+  const ATTACH_UPLOAD_MS = 45000;
+
+  function toFile({ name, mime, base64 }) {
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new File([bytes], name, { type: mime, lastModified: Date.now() });
+  }
+
+  function outsideHistory(el) {
+    return !el.closest('.ds-message') && el.tagName !== 'TEXTAREA';
+  }
+
+  // The composer box: the largest ancestor of the chat input that doesn't also hold the
+  // chat history. Attachment chips render in here; scanning the whole page instead
+  // matched the file name in our own prompt text and in <script> contents.
+  function composerRoot() {
+    let el = query(SELECTORS.textarea);
+    if (!el) return document.body;
+    for (let i = 0; i < 8 && el.parentElement && el.parentElement !== document.body; i++) {
+      if (el.parentElement.querySelector('.ds-message')) break;
+      el = el.parentElement;
+    }
+    return el;
+  }
+
+  // DeepSeek may shorten long names in the chip ("Screenshot 2026-10-...png"), so match
+  // on a prefix.
+  function attachmentMarkers(name) {
+    const prefix = name.slice(0, Math.min(12, name.lastIndexOf('.') > 0 ? name.lastIndexOf('.') : name.length));
+    let named = 0;
+    let classed = 0;
+    let imgs = 0;
+    for (const el of composerRoot().querySelectorAll('*')) {
+      if (!outsideHistory(el) || el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
+      if (el.children.length === 0 && (el.textContent || '').includes(prefix)) named++;
+      if (/(^|[\s_-])(file|attach|upload)/i.test(typeof el.className === 'string' ? el.className : '')) classed++;
+      if (el.tagName === 'IMG') imgs++;
+    }
+    return { named, classed, imgs };
+  }
+
+  function grewFrom(before, name) {
+    const now = attachmentMarkers(name);
+    return now.named > before.named || now.classed > before.classed || now.imgs > before.imgs;
+  }
+
+  async function waitFor(pred, ms) {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (pred()) return true;
+      await sleep(200);
+    }
+    return pred();
+  }
+
+  async function attachFiles(attachments) {
+    const textarea = query(SELECTORS.textarea);
+    if (!textarea) throw new Error('Could not locate chat input to attach images to.');
+    const report = { attached: [], failed: [] };
+
+    for (const a of attachments) {
+      // A resend after a failed attempt (sendToTabResilient retries) finds the file
+      // already in the composer -- don't add it twice.
+      if (attachmentMarkers(a.name).named > 0) {
+        report.attached.push({ name: a.name, via: 'already-attached' });
+        continue;
+      }
+      const file = toFile(a);
+      const before = attachmentMarkers(a.name);
+      const dt = () => {
+        const d = new DataTransfer();
+        d.items.add(file);
+        return d;
+      };
+      const strategies = [
+        ['paste', () => {
+          textarea.focus();
+          textarea.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt(), bubbles: true, cancelable: true }));
+        }],
+        ['file-input', () => {
+          const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+          const input = inputs.find((i) => !i.accept || /image|\*/.test(i.accept)) || inputs[0];
+          if (!input) return false;
+          input.files = dt().files;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }],
+        ['drop', () => {
+          const target = textarea.parentElement || textarea;
+          const d = dt();
+          for (const type of ['dragenter', 'dragover', 'drop']) {
+            target.dispatchEvent(new DragEvent(type, { dataTransfer: d, bubbles: true, cancelable: true }));
+          }
+        }],
+      ];
+
+      let via = null;
+      for (const [label, run] of strategies) {
+        try {
+          if (run() === false) continue;
+        } catch (err) {
+          console.warn(`[MyClaudeCode] attach ${a.name} via ${label} threw:`, err.message);
+          continue;
+        }
+        if (await waitFor(() => grewFrom(before, a.name), ATTACH_DETECT_MS)) {
+          via = label;
+          break;
+        }
+      }
+      if (!via) {
+        report.failed.push({ name: a.name, error: 'DeepSeek did not show the attachment after paste, file-input, or drop.' });
+        continue;
+      }
+      console.log(`[MyClaudeCode] attached ${a.name} via ${via}`);
+      report.attached.push({ name: a.name, via });
+    }
+
+    // Uploads finish asynchronously; sending before then drops the image or blocks the
+    // send button. Wait for any progress/loading indicator outside the history to clear.
+    if (report.attached.length) {
+      await sleep(500);
+      await waitFor(() => !Array.from(composerRoot().querySelectorAll(
+        '[role="progressbar"], [class*="progress"], [class*="loading"], [class*="uploading"], [class*="spin"]'
+      )).some((el) => outsideHistory(el) && el.offsetParent !== null), ATTACH_UPLOAD_MS);
+    }
+    return report;
+  }
+
+  async function typeAndSend(text, { instant = false, attachments = null } = {}) {
     await waitForReadyState();
     if (hasLengthLimitReached()) {
       throw new Error('DeepSeek chat length limit reached — this chat has run out of context and needs a fresh tab.');
@@ -972,6 +1599,9 @@
     const textarea = query(SELECTORS.textarea);
     const sendButton = query(SELECTORS.sendButton);
     if (!textarea || !sendButton) throw new Error('Could not locate chat input or send button.');
+
+    // Attach before typing, so the files are part of this message.
+    const attachmentReport = attachments && attachments.length ? await attachFiles(attachments) : null;
 
     const baselineMsgsAtSend = document.querySelectorAll(SELECTORS.assistantMessage);
     const baselineCount = baselineMsgsAtSend.length;
@@ -998,7 +1628,7 @@
     await clickSendAndConfirm(sendButton, textarea, baselineUserCount, { generous: wasPasted });
 
     const reply = await waitForAssistantSettle(baselineCount, undefined, baselineLastNode);
-    return { text: reply.text, diagnostics: reply.diagnostics };
+    return { text: reply.text, diagnostics: reply.diagnostics, attachmentReport };
   }
 
   function extractLastResponse() {
@@ -1095,9 +1725,36 @@
     return toggleFeature(null, 'DeepThink', enabled);
   }
 
+  // Continue-button MutationObserver (Addendum 2 Part I, Fix 2). The 250ms poll loop can,
+  // in principle, miss a Continue button that appears and disappears between ticks. This
+  // catches the appearance moment as a hint — see continueJustAppearedAt's declaration for
+  // exactly how the poll loop consumes it (as a diagnostic signal, not a control-flow gate).
+  // Primary fix for the truncation bug is the continueJustClickedAt grace period.
+  try {
+    const continueObserver = new MutationObserver(() => {
+      try {
+        if (findContinueButton()) continueJustAppearedAt = Date.now();
+      } catch (_) {
+        // ignore — a transient DOM state during navigation shouldn't break the observer
+      }
+    });
+    if (document.body) {
+      continueObserver.observe(document.body, { childList: true, subtree: true });
+    }
+  } catch (_) {
+    console.warn('[MyClaudeCode] Could not install Continue MutationObserver.');
+  }
+
+  try {
+    // Any top-level initialization that could throw should go here.
+    // Currently empty, but ensures the onMessage listener below is always registered.
+  } catch (initErr) {
+    console.error('[MyClaudeCode] Content script init error:', initErr);
+  }
+
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'typeAndSend') {
-      typeAndSend(request.text, { instant: request.instant })
+      typeAndSend(request.text, { instant: request.instant, attachments: request.attachments })
         .then(sendResponse)
         // err.diagnostics (see waitForAssistantSettle's rejectWithDiagnostics) rides along
         // on a failure too now, not just a success — otherwise a timeout crossing this
@@ -1143,6 +1800,16 @@
       if (!query(SELECTORS.textarea)) missing.push('textarea');
       if (!query(SELECTORS.sendButton)) missing.push('sendButton');
       sendResponse({ missing });
+      return false;
+    }
+    if (request.action === 'rateLimitDetected') {
+      // Set by background.js's chrome.webRequest listener — see its comment for why that
+      // replaced the DOM-only approach. waitForAssistantSettle's poll loop reads
+      // lastRateLimitAt on every tick and rejects with a specific RATE_LIMIT: error once
+      // it sees one that post-dates the current turn's start.
+      lastRateLimitAt = request.ts || Date.now();
+      rateLimitStatusCode = request.statusCode || null;
+      console.log('[MyClaudeCode] Rate limit detected:', request.statusCode || request.error);
       return false;
     }
     if (request.action === 'streamCompleted') {

@@ -54,6 +54,35 @@ const TabManager = (() => {
     }
   }
 
+  // "Could not establish connection. Receiving end does not exist." — nothing in the tab is
+  // listening. Three real causes: the extension was reloaded/updated (the old content.js is
+  // orphaned and can't receive from the new service worker), Chrome's Memory Saver discarded
+  // the idle tab, or the page navigated and content.js hasn't loaded yet. None of them are
+  // fixed by just waiting, which is all the generic retry in sendToTabResilient does.
+  const NO_RECEIVER_RE = /receiving end does not exist|could not establish connection/i;
+
+  // Gets a live content.js into the tab without losing the chat: discarded tabs have to be
+  // reloaded (no document to inject into), everything else gets content.js injected in
+  // place — content.js's own instance guard makes that a no-op if a live copy is already
+  // there. streamBridge.js is deliberately not re-injected: it patches window.fetch in the
+  // MAIN world and would double-patch, and webRequest already covers its signal.
+  async function recoverContentScript(tabId) {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.discarded || tab.status === 'unloaded') {
+      console.warn(`[TabManager] Tab ${tabId} was discarded — reloading.`);
+      await chrome.tabs.reload(tabId);
+    } else {
+      console.warn(`[TabManager] No content script in tab ${tabId} — re-injecting.`);
+      try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+      } catch (err) {
+        console.warn(`[TabManager] Injection into tab ${tabId} failed (${err.message}) — reloading.`);
+        await chrome.tabs.reload(tabId);
+      }
+    }
+    return pollForReady(tabId, READY_RETRY_PER_ATTEMPT_MS);
+  }
+
   async function sendToTab(tabId, message) {
     // Bring the tab to front first so interactions look human (stealth requirement) and so
     // its own JS isn't throttled while it types/renders our message.
@@ -67,7 +96,15 @@ const TabManager = (() => {
     } catch (_) {
       // tab/window may have been closed; let the sendMessage call surface the error
     }
-    return chrome.tabs.sendMessage(tabId, message);
+    try {
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch (err) {
+      if (!NO_RECEIVER_RE.test((err && err.message) || '')) throw err;
+      // The message was never delivered, so resending it once can't duplicate anything
+      // in the chat.
+      if (!(await recoverContentScript(tabId).catch(() => false))) throw err;
+      return chrome.tabs.sendMessage(tabId, message);
+    }
   }
 
   // Observed live (2026-08-14), same day as the fix above: the one-shot focus() call in
@@ -93,14 +130,33 @@ const TabManager = (() => {
 
   async function pollForReady(tabId, timeoutMs) {
     const start = Date.now();
+    let lastErr = null;
+    let injected = false;
     while (Date.now() - start < timeoutMs) {
       try {
         const res = await chrome.tabs.sendMessage(tabId, { action: 'waitForReady' });
         if (res && res.ready) return true;
-      } catch (_) {
-        // content script may not be injected yet; retry
+      } catch (err) {
+        lastErr = err.message;
+        // content script may not be injected yet; retry. If the page has finished loading
+        // and there's still no receiver, it's not coming on its own (orphaned after an
+        // extension reload) — inject once rather than waiting out the full timeout.
+        if (!injected && NO_RECEIVER_RE.test(lastErr) && Date.now() - start > 3000) {
+          injected = true;
+          try {
+            const tab = await chrome.tabs.get(tabId);
+            if (tab.status === 'complete' && !tab.discarded) {
+              await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+            }
+          } catch (_) {
+            // not injectable (error page, closed tab) — waitForReady's reload handles it
+          }
+        }
       }
       await new Promise((r) => setTimeout(r, 300));
+    }
+    if (lastErr) {
+      console.warn(`[TabManager] pollForReady failed after ${timeoutMs}ms: ${lastErr}`);
     }
     return false;
   }
@@ -231,8 +287,8 @@ const TabManager = (() => {
         // fall back to the multi-attempt default — exactly the bug this fixed (see
         // waitForReady's own comment).
         await waitForReady(tabId, { attempts: 1 });
-      } catch (_) {
-        // still not back — fall through to the plain delay and try the send again anyway.
+      } catch (waitErr) {
+        console.warn(`[TabManager] Tab ${tabId} still not ready before retry: ${waitErr.message}`);
       }
       await new Promise((r) => setTimeout(r, delayMs));
     }
@@ -252,6 +308,177 @@ const TabManager = (() => {
     }
   }
 
+  // Opens a URL in a new tab and records everything the page logs from the very first
+  // byte: console.* calls of every level, uncaught exceptions and rejections, failed and
+  // 4xx/5xx requests, and whether the page loaded at all. Uses chrome.debugger (CDP) and
+  // attaches BEFORE navigating -- the legacy path below injected a listener ~3s after load,
+  // which missed load-time errors (failed module imports, 404'd JSON) and needed a host
+  // permission per origin. The tab is left open for the user; only the debugger detaches.
+  const INSPECT_LOAD_TIMEOUT_MS = 15000;
+  const INSPECT_SETTLE_MS = 3000;
+  const INSPECT_MAX_LOGS = 200;
+
+  function remoteObjectText(o) {
+    if (!o) return '';
+    if (o.type === 'string') return o.value;
+    if ('value' in o) return JSON.stringify(o.value);
+    return o.unserializableValue || o.description || o.type;
+  }
+
+  function frameLocation(stackTrace, url, line) {
+    const f = stackTrace && stackTrace.callFrames && stackTrace.callFrames[0];
+    const u = (f && f.url) || url;
+    const l = f ? f.lineNumber : line;
+    if (!u) return '';
+    return ` (${u.replace(/^https?:\/\/[^/]+/, '')}${typeof l === 'number' ? ':' + (l + 1) : ''})`;
+  }
+
+  async function inspectTab(url) {
+    const tab = await chrome.tabs.create({ url: 'about:blank', active: true });
+    const target = { tabId: tab.id };
+    try {
+      await chrome.debugger.attach(target, '1.3');
+    } catch (err) {
+      console.warn('[TabManager] inspectTab: debugger attach failed, using legacy inspector:', err.message);
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      const legacy = await inspectTabLegacy(url);
+      return { ...legacy, logs: [], failedRequests: [], loadError: null, pageInfo: null };
+    }
+
+    const logs = []; // { level, text }
+    const failedRequests = [];
+    const requestUrls = new Map();
+    let loaded = false;
+    const push = (level, text) => {
+      if (logs.length < INSPECT_MAX_LOGS) logs.push({ level, text: String(text).slice(0, 1000) });
+    };
+    const onEvent = (source, method, params) => {
+      if (source.tabId !== tab.id) return;
+      if (method === 'Runtime.consoleAPICalled') {
+        const level = params.type === 'warning' ? 'warn' : params.type === 'assert' ? 'error' : params.type;
+        push(level, (params.args || []).map(remoteObjectText).join(' ') + frameLocation(params.stackTrace));
+      } else if (method === 'Runtime.exceptionThrown') {
+        const d = params.exceptionDetails || {};
+        const text = (d.exception && d.exception.description) || d.text || 'Uncaught exception';
+        push('error', text.split('\n').slice(0, 4).join('\n') + frameLocation(d.stackTrace, d.url, d.lineNumber));
+      } else if (method === 'Log.entryAdded') {
+        const e = params.entry || {};
+        // network-sourced entries duplicate failedRequests below
+        if (e.source === 'network') return;
+        if (e.level === 'error' || e.level === 'warning') {
+          push(e.level === 'warning' ? 'warn' : 'error', e.text + frameLocation(null, e.url, e.lineNumber));
+        }
+      } else if (method === 'Network.requestWillBeSent') {
+        requestUrls.set(params.requestId, params.request && params.request.url);
+      } else if (method === 'Network.responseReceived') {
+        const r = params.response || {};
+        if (r.status >= 400 && !/\/favicon\.ico$/.test(r.url)) failedRequests.push(`HTTP ${r.status} ${r.url}`);
+      } else if (method === 'Network.loadingFailed') {
+        if (params.canceled) return;
+        const u = requestUrls.get(params.requestId) || '(unknown url)';
+        if (!/\/favicon\.ico$/.test(u)) {
+          failedRequests.push(`${params.blockedReason ? 'BLOCKED ' + params.blockedReason : params.errorText} ${u}`);
+        }
+      } else if (method === 'Page.loadEventFired') {
+        loaded = true;
+      }
+    };
+    chrome.debugger.onEvent.addListener(onEvent);
+
+    let loadError = null;
+    let pageInfo = null;
+    let screenshotBase64 = null;
+    try {
+      const send = (m, p) => chrome.debugger.sendCommand(target, m, p || {});
+      await send('Runtime.enable');
+      await send('Log.enable');
+      await send('Network.enable');
+      await send('Page.enable');
+      const nav = await send('Page.navigate', { url });
+      if (nav && nav.errorText) loadError = nav.errorText;
+      const start = Date.now();
+      while (!loadError && !loaded && Date.now() - start < INSPECT_LOAD_TIMEOUT_MS) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      if (!loadError && !loaded) loadError = `load event did not fire within ${INSPECT_LOAD_TIMEOUT_MS / 1000}s`;
+      // Let async startup (module graphs, fetches, first frames) run and log.
+      await new Promise((r) => setTimeout(r, INSPECT_SETTLE_MS));
+      if (!nav || !nav.errorText) {
+        try {
+          const ev = await send('Runtime.evaluate', {
+            returnByValue: true,
+            expression: `({
+              title: document.title,
+              readyState: document.readyState,
+              text: (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 400),
+              canvases: document.querySelectorAll('canvas').length,
+              elements: document.querySelectorAll('body *').length,
+            })`,
+          });
+          pageInfo = ev && ev.result ? ev.result.value : null;
+        } catch (_) {}
+      }
+      try {
+        const shot = await send('Page.captureScreenshot', { format: 'png' });
+        screenshotBase64 = shot && shot.data;
+      } catch (_) {}
+    } catch (err) {
+      loadError = loadError || 'inspector error: ' + err.message;
+    } finally {
+      chrome.debugger.onEvent.removeListener(onEvent);
+      chrome.debugger.detach(target).catch(() => {});
+    }
+
+    // Back-compat: `errors` is what the !INSPECT_TAB callers and older code read.
+    const errors = logs.filter((l) => l.level === 'error').map((l) => l.text).concat(failedRequests);
+    if (loadError) errors.unshift(`Page failed to load: ${loadError}`);
+    return { errors, logs, failedRequests, loadError, pageInfo, screenshotBase64 };
+  }
+
+  async function inspectTabLegacy(url) {
+    // If it's a relative file path (like 'vanilla.html'), convert it to a file:// URL
+    let finalUrl = url;
+    if (!/^https?:\/\//i.test(url) && !url.startsWith('file://')) {
+      if (url.endsWith('.html')) {
+        // Best-effort: assume it's a local file. The caller should really pass an absolute URL or file path.
+        finalUrl = url; // Fallback
+      }
+    }
+    const tab = await chrome.tabs.create({ url: finalUrl, active: true });
+    await new Promise(r => setTimeout(r, 3000));
+    let errors = [];
+    try {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          return new Promise((resolve) => {
+            const errs = [];
+            const handler = (e) => errs.push(e.message || String(e));
+            const rejHandler = (e) => errs.push('Unhandled Rejection: ' + String(e.reason));
+            window.addEventListener('error', handler);
+            window.addEventListener('unhandledrejection', rejHandler);
+            setTimeout(() => {
+              window.removeEventListener('error', handler);
+              window.removeEventListener('unhandledrejection', rejHandler);
+              resolve(errs);
+            }, 2000);
+          });
+        }
+      });
+      errors = result || [];
+    } catch (err) {
+      errors = ['Failed to inject error listener: ' + err.message];
+    }
+    
+    let screenshotBase64 = null;
+    try {
+      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+      if (dataUrl) screenshotBase64 = dataUrl.split(',')[1];
+    } catch (_) {}
+    
+    return { errors, screenshotBase64 };
+  }
+
   return {
     chatUrl,
     createPlannerTab,
@@ -263,5 +490,6 @@ const TabManager = (() => {
     refocusTab,
     waitForReady,
     checkSelectors,
+    inspectTab,
   };
 })();

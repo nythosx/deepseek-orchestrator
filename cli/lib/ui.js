@@ -427,6 +427,24 @@ const ui = {
 
   stopThinking: () => clearSpinner(),
 
+  // DeepSeek rate limit: live "retrying in mm:ss" in the spinner slot until the retry
+  // (the next THINKING_STARTED replaces it).
+  rateLimitCountdown(role, retryAt, attempt, maxRetries) {
+    clearSpinner();
+    const label = ROLE_NAME[role] || role || 'Agent';
+    const mins = Math.max(1, Math.round((retryAt - Date.now()) / 60000));
+    out(paint('yellow', '●'), `DeepSeek rate limit on ${label} — retrying on the same tab every ${mins} min (attempt ${attempt}/${maxRetries}).`);
+    if (!process.stdout.isTTY) return;
+    const tick = () => {
+      const left = Math.max(0, Math.round((retryAt - Date.now()) / 1000));
+      const mm = String(Math.floor(left / 60)).padStart(2, '0');
+      const ss = String(left % 60).padStart(2, '0');
+      screen.status(paint('yellow', `⏳ Rate limited (${label}) — retrying in ${mm}:${ss}`));
+    };
+    tick();
+    spinnerTimer = setInterval(tick, SPINNER_INTERVAL_MS);
+  },
+
   gatePass: () => out(paint('green', '● Quality gates passed.')),
   gate: (gate, output) => {
     out(paint('yellow', `● Quality gate failed: ${gate}`));
@@ -438,6 +456,27 @@ const ui = {
     out(paint('bold', indent(description)));
     if (matchedWord) out(paint('dim', indent(`matched dangerous command: "${matchedWord}"`)));
     if (cwd) out(paint('dim', indent(`cwd: ${cwd}`)));
+  },
+
+  continueRecap(entries, limit = 10) {
+    if (!entries.length) {
+      out(paint('gray', 'No previous activity for this project — starting fresh.'));
+      out();
+      return;
+    }
+    const shown = entries.slice(-limit);
+    out(paint('dim', `Continuing previous session (${shown.length} of ${entries.length} past task(s)):`));
+    out();
+    for (const entry of shown) {
+      const taskText = String(entry.task || '(unknown task)').replace(/\s+/g, ' ').trim();
+      out(paint('bold', '❯ ') + (taskText.length > 160 ? `${taskText.slice(0, 160)}…` : taskText));
+      const ok = entry.status === 'completed';
+      const detail = stripStructured((ok ? entry.summary : entry.message) || '') || (ok ? 'Task completed.' : 'Task failed.');
+      out(ok ? paint('green', '●') : paint('red', '●'), paint('dim', indent(truncate(detail)).trimStart()));
+      out();
+    }
+    out(paint('dim', '─'.repeat(Math.min(terminalWidth(), 60))));
+    out();
   },
 
   historyList(entries, limit = 20) {
@@ -501,6 +540,58 @@ const ui = {
     const more = expandCursor < expandHistory.length - 1 ? ' — ctrl+o again for older' : ' (oldest kept)';
     out(paint('bold', paint('cyan', `● Expanded (${position})${paint('dim', more)}`)));
     out(indent(expandHistory[expandCursor]));
+  },
+
+  phaseStarted: (name, index, total) => {
+    out(paint('cyan', '●'), paint('bold', `Phase ${index}/${total}: ${name}`));
+  },
+
+  phaseSuccess: (name, durationMs, filesTouched) => {
+    const secs = (durationMs / 1000).toFixed(1);
+    out(paint('green', '●'), paint('bold', `Phase complete: ${name}`), paint('dim', `(${secs}s)`));
+    if (filesTouched && filesTouched.length) {
+      out(paint('dim', `  wrote: ${filesTouched.join(', ')}`));
+    }
+  },
+
+  phaseFailed: (name, attempts, traceback) => {
+    out(paint('red', '●'), paint('bold', `Phase failed: ${name}`), paint('dim', `after ${attempts} attempt(s)`));
+    if (traceback) out(paint('dim', indent(truncate(traceback))));
+  },
+
+  directMode: (estimate) => {
+    out(paint('cyan', '●'), `Direct mode (est. ${estimate} LOC)`);
+  },
+
+  escalated: (reason, filesTouched) => {
+    out(paint('yellow', '●'), paint('bold', 'Direct mode failed — escalating to phased'));
+    if (reason) out(paint('dim', indent(reason)));
+    if (filesTouched && filesTouched.length) {
+      out(paint('dim', indent(`files already touched: ${filesTouched.join(', ')}`)));
+    }
+  },
+
+  attentionItem: (item) => {
+    const severity = (item && item.severity) || 'medium';
+    const color = severity === 'critical' ? 'red' : severity === 'high' ? 'yellow' : 'gray';
+    out(paint(color, '●'), paint('bold', `[${severity}]`), (item && item.detail) || '(no detail)');
+  },
+
+  migrated: (role, reason, mode, bundleChars) => {
+    out(paint('cyan', '●'), `Migrated ${role} tab (${reason}, ${mode} bundle, ${bundleChars} chars)`);
+  },
+
+  bundleTooLarge: (chars, threshold) => {
+    out(paint('yellow', '●'), `Bundle too large: ${chars} chars (threshold ${threshold})`);
+  },
+
+  exclusionRoundStarted: () => {
+    out(paint('cyan', '●'), 'Exclusion round started');
+  },
+
+  exclusionRoundDone: (round, chars, stillTooLarge) => {
+    const suffix = stillTooLarge ? ' — still too large' : '';
+    out(paint('cyan', '●'), `Exclusion round ${round} done: ${chars} chars${suffix}`);
   },
 };
 

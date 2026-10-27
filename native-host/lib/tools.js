@@ -88,10 +88,27 @@ function resolveInProject(projectRoot, relPath, { allowOutside = false } = {}) {
 // unless it actually asked for a page or the file is genuinely huge.
 const READ_FILE_DEFAULT_MAX_LINES = 2000;
 
-function readFile(projectRoot, { path: relPath, offset, limit }) {
-  const target = resolveInProject(projectRoot, relPath);
+// Phase 25 (2026-10-25): readFile now honors an `allowOutside` flag. When
+// true, the path can resolve outside the project root. Used by the phased-mode
+// brain during triage inspection (see PhasedRunner.runBrainToolCalls) -- a user
+// asking "what about that other project at C:\\...?" needs the brain to be able
+// to read it. Default (no flag) preserves the original behavior: everything is
+// hard-scoped to the project. The brain caller injects allowOutside=true; the
+// legacy orchestrator never does, so legacy stays byte-identical in scope.
+//
+// Safety cap: when allowOutside is true, files > 500,000 chars are truncated
+// with a marker -- protects the caller from accidentally reading a huge system
+// file (e.g. a 5MB log) into the brain prompt.
+const MAX_ALLOW_OUTSIDE_CHARS = 500_000;
+function readFile(projectRoot, { path: relPath, offset, limit, allowOutside = false }) {
+  const target = resolveInProject(projectRoot, relPath, { allowOutside });
   if (!fs.existsSync(target)) throw new Error(`File not found: ${relPath}`);
-  const content = fs.readFileSync(target, 'utf8');
+  let content = fs.readFileSync(target, 'utf8');
+  if (allowOutside && content.length > MAX_ALLOW_OUTSIDE_CHARS) {
+    content = content.slice(0, MAX_ALLOW_OUTSIDE_CHARS) +
+      `\n…(truncated at ${MAX_ALLOW_OUTSIDE_CHARS} of ${content.length} chars -- ` +
+      `use !READ_FILE <path> <offset> <limit> for a specific range)`;
+  }
 
   const hasExplicitRange = offset != null || limit != null;
   const lines = content.split('\n');
@@ -726,8 +743,19 @@ function openApp(projectRoot, { command }) {
   });
 }
 
-function grep(projectRoot, { pattern, path: subPath }) {
-  const dir = resolveInProject(projectRoot, subPath || '.');
+// Phase 25 (2026-10-25): grep honors allowOutside, with a filesystem-root
+// guard -- refuses to grep a drive root or / because that would recurse the
+// entire filesystem. Brain should point at a specific subdirectory.
+function grep(projectRoot, { pattern, path: subPath, allowOutside = false }) {
+  const dir = resolveInProject(projectRoot, subPath || '.', { allowOutside });
+  if (allowOutside) {
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      throw new Error(
+        `Refusing to grep the filesystem root (${dir}). Point at a specific subdirectory.`
+      );
+    }
+  }
   return new Promise((resolve) => {
     const tryTool = (cmd, args, onMissing) => {
       const child = spawn(cmd, args, { cwd: projectRoot });
@@ -822,7 +850,11 @@ async function httpGet(projectRoot, { url }) {
   }
 }
 
-function ls(projectRoot, { path: subPath }) {
+// Phase 25 (2026-10-25): ls honors allowOutside (brain triage inspection).
+// Safety cap: when allowOutside is true, output is capped at 300 entries with a
+// truncation marker -- protects against !LS C:\\ returning thousands of names.
+const MAX_ALLOW_OUTSIDE_LS_ENTRIES = 300;
+function ls(projectRoot, { path: subPath, allowOutside = false }) {
   // LS never supports shell-style flags (-la etc.) — a model occasionally sends them
   // anyway (e.g. "!LS -la some/path"), which would otherwise be treated as a literal,
   // bogus path component ("-la some/path") and fail with a confusing ENOENT. Strip any
@@ -831,15 +863,20 @@ function ls(projectRoot, { path: subPath }) {
   while (/^-\S+(\s|$)/.test(cleaned)) {
     cleaned = cleaned.replace(/^-\S+\s*/, '').trim();
   }
-  const target = resolveInProject(projectRoot, cleaned || '.');
+  const target = resolveInProject(projectRoot, cleaned || '.', { allowOutside });
   const entries = fs.readdirSync(target, { withFileTypes: true });
-  return entries
-    .map((e) => {
-      const stat = fs.statSync(path.join(target, e.name));
-      const type = e.isDirectory() ? 'd' : '-';
-      return `${type} ${String(stat.size).padStart(8)} ${e.name}`;
-    })
-    .join('\n');
+  const cap = allowOutside ? MAX_ALLOW_OUTSIDE_LS_ENTRIES : entries.length;
+  const shown = entries.slice(0, cap);
+  const lines = shown.map((e) => {
+    let stat;
+    try { stat = fs.statSync(path.join(target, e.name)); } catch (_) { stat = { size: 0 }; }
+    const type = e.isDirectory() ? 'd' : '-';
+    return `${type} ${String(stat.size).padStart(8)} ${e.name}`;
+  });
+  if (entries.length > cap) {
+    lines.push(`…(${entries.length - cap} more entries omitted; !LS <specific-subdir> to narrow)`);
+  }
+  return lines.join('\n');
 }
 
 // Backs progress-based stall detection (orchestrator.js): a cheap fingerprint of the whole
@@ -1012,6 +1049,19 @@ function loadExternalTools(projectRoot) {
 }
 // -----------------------------------------------------------------------------------------
 
+// Backs TOOLS.FILETRACK_SCAN (see shared/protocol.js) — delegates to the dedicated
+// filetrack module. Wrapped here rather than exposed directly so host.js's execTool switch
+// stays a plain "case TOOLS.X: return tools.Y(params)" one-liner like every other tool.
+// `mode` is 'check' (baseline-only on first run, otherwise read+log changes) or
+// 'snapshot' (also force a snapshot write even with zero changes, used at task end).
+function filetrackScan(projectRoot, params) {
+  const filetrack = require('./filetrack');
+  return filetrack.computeChanges(projectRoot, {
+    mode: (params && params.mode) || 'check',
+    bulkThreshold: (params && params.bulkThreshold) || 100,
+  });
+}
+
 module.exports = {
   PathSafetyError,
   resolveInProject,
@@ -1044,4 +1094,5 @@ module.exports = {
   listTasks,
   loadRuleFiles,
   loadExternalTools,
+  filetrackScan,
 };

@@ -1,0 +1,14 @@
+{
+  "description": "Escalation: direct mode fails 3x (executor raises RuntimeError), then escalation response returns [PHASED] with 2 phases, both succeed",
+  "planner": [
+    "[DIRECT] [EST_LOC 100]\n[BRIEF]\n  files_to_touch: broken.txt\n  changes:\n    - broken.txt: create broken file (this will fail)\n  tests: verify\n  risks: deliberate failure for escalation testing\n[/BRIEF]",
+    "[PHASED] [EST_LOC 5000] [EST_PHASES 2]\n[PHASE name=\"fix-1\" files=\"fixed1.txt\"]\n  goal: Create fixed1.txt\n  tests: verify exists\n[/PHASE]\n[PHASE name=\"fix-2\" files=\"fixed2.txt\"]\n  goal: Create fixed2.txt\n  tests: verify exists\n[/PHASE]"
+  ],
+  "executor": [
+    "```python\nraise RuntimeError('deliberate failure attempt 1')\n```",
+    "```python\nraise RuntimeError('deliberate failure attempt 2')\n```",
+    "```python\nraise RuntimeError('deliberate failure attempt 3')\n```",
+    "```python\nfrom pathlib import Path\nPath('fixed1.txt').write_text('Fixed 1\\n')\nprint('__PHASE_WROTE__ fixed1.txt')\nassert Path('fixed1.txt').exists()\nprint('__PHASE_SUCCESS__')\n```",
+    "```python\nfrom pathlib import Path\nPath('fixed2.txt').write_text('Fixed 2\\n')\nprint('__PHASE_WROTE__ fixed2.txt')\nassert Path('fixed2.txt').exists()\nprint('__PHASE_SUCCESS__')\n```"
+  ]
+}

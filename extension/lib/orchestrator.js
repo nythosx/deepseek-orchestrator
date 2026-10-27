@@ -837,9 +837,27 @@ const Orchestrator = (() => {
             ? await askUser(session.taskId, call.params.question, call.params.options)
             : call.tool === TOOLS.SEARCH_WEB
               ? await performWebSearch(session, call.params.query)
-              : call.tool.startsWith('CALL_')
-                ? await callExternalTool(session, call.tool, call.params.args)
-                : await NativeBridge.execTool(session.taskId, call.tool, call.params);
+              : call.tool === TOOLS.INSPECT_TAB
+                ? await (async () => {
+                    const inspectResult = await TabManager.inspectTab(call.params.url);
+                    let screenshotPath = null;
+                    if (inspectResult.screenshotBase64) {
+                      const filename = `screenshot_${Date.now()}.b64`;
+                      screenshotPath = `.myclaudecode/screenshots/${filename}`;
+                      await NativeBridge.execTool(session.taskId, TOOLS.WRITE_FILE, {
+                        path: screenshotPath,
+                        content: inspectResult.screenshotBase64,
+                      }).catch(() => {});
+                    }
+                    return {
+                      errors: inspectResult.errors,
+                      screenshotPath,
+                      note: screenshotPath ? 'Screenshot saved as base64 at ' + screenshotPath : 'No screenshot captured.',
+                    };
+                  })()
+                : call.tool.startsWith('CALL_')
+                  ? await callExternalTool(session, call.tool, call.params.args)
+                  : await NativeBridge.execTool(session.taskId, call.tool, call.params);
         notifyCli({
           type: CLI_MESSAGE_TYPES.TIMING,
           taskId: session.taskId,

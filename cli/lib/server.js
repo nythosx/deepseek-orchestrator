@@ -127,6 +127,12 @@ async function startServer() {
       settled = true;
       clearTimeout(timer);
       ws.removeListener('message', onMessage);
+      // profileId: attached by host.js from the extension's chrome.storage.local (see
+      // background.js's ensureProfileId). Null on a race-y first handshake is tolerated —
+      // v1 doesn't actually require it, and the next reconnect will have it. Only relevant
+      // to v2's cross-profile routing, but attaching it here is the cheapest way to make
+      // that a clean additive change later rather than a refactor.
+      ws.profileId = (msg && msg.profileId) || null;
       if (pendingResolve) {
         const resolve = pendingResolve;
         pendingResolve = null;

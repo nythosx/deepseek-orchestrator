@@ -15,11 +15,17 @@ const { CLI_MESSAGE_TYPES } = require('../shared/protocol');
 
 const program = new Command();
 program
-  .name('my-claude-code')
+  .name('deeper')
   .argument('[task]', 'high-level instruction for the agent (omit to connect and be prompted interactively)')
   .option('--approve-all', 'skip all manual approval prompts', false)
   .option('--disable-web-search', 'prevent the AI from using web search', false)
-  .option('--deep-think', 'enable DeepSeek\'s DeepThink reasoning mode', false)
+  .option('--deep-think', 'enable DeepSeek\'s DeepThink reasoning mode (legacy: both tabs; phased: brain on, coder off by default)')
+  .option('--no-deep-think', 'disable DeepThink on both tabs')
+  .option('--phased', 'phased mode (default; kept as an explicit flag for backward compat — no-op)', false)
+  .option('--legacy', 'use the legacy v1 planner/executor workflow instead of the default phased mode', false)
+  .option('--filetrack', 'force filetrack on for this run')
+  .option('--no-filetrack', 'force filetrack off for this run')
+  .option('-c, --continue', 'continue the previous DeepSeek brain/coder tabs for this project and show past activity', false)
   .option(
     '--resume',
     'reattach to this project\'s existing planner/executor chat tabs instead of starting fresh',
@@ -83,6 +89,23 @@ async function main() {
   const projectRoot = process.cwd();
   const configDir = opts.config ? path.resolve(opts.config) : path.join(projectRoot, '.myclaudecode');
   const { config, permissions } = ensureProjectConfig(configDir);
+  if (opts.phased && opts.legacy) {
+    console.error('Error: --phased and --legacy are mutually exclusive.');
+    process.exit(1);
+  }
+  // Phase 9 (2026-10-25): phased is now the automatic default. `myclaudecode "task"`
+  // runs phased mode with no flags needed -- the brain triages DIRECT vs PHASED, the
+  // coder produces one a.py per unit of work, and every project-file change goes
+  // through `python a.py` rather than one-file-at-a-time !WRITE_FILE/!EDIT_FILE tool
+  // calls. Legacy mode stays reachable via --legacy (fallback for debugging and for
+  // analysis-only tasks that don't fit the a.py model).
+  //
+  // config.phased.enabled is kept in the config file for backward compat, but no longer
+  // affects mode selection -- only --legacy does. Existing configs with
+  // phased.enabled: false will simply be ignored (harmless; the user can flip or
+  // delete the field).
+  const phasedEnabled = !opts.legacy;
+  const filetrackOverride = opts.filetrack === true ? true : opts.filetrack === false ? false : null;
   const logger = makeLogger(configDir);
 
   if (opts.history) {
@@ -137,6 +160,7 @@ async function main() {
   process.on('SIGTERM', () => cleanupAndExit(0));
 
   ui.banner();
+  if (opts.continue) ui.continueRecap(readHistory(configDir));
 
   if (opts.verbose) {
     ui.debug(`Project root: ${projectRoot}`);
@@ -382,7 +406,7 @@ async function main() {
   // fresh run. This flag is the actual signal that matters: "has THIS process sent any task
   // yet," not "was a task argument given on argv" — sendTask itself falls back to it below
   // whenever a call site doesn't specify `resume` explicitly.
-  let hasSentAnyTaskInThisProcess = false;
+  let hasSentAnyTaskInThisProcess = !!opts.continue;
 
   // The very first task in this process only reattaches when explicitly asked via --resume
   // (see the argv call site below, which always specifies `resume` itself and so never hits
@@ -412,7 +436,7 @@ async function main() {
       options: {
         approveAll,
         webSearch: !opts.disableWebSearch,
-        deepThink: !!opts.deepThink,
+        deepThink: opts.deepThink,
         resume: effectiveResume,
         // orchestrator.js runs in the browser extension, with no OS access of its own —
         // the CLI (real Node process) is the only place `process.platform` is available at
@@ -422,6 +446,9 @@ async function main() {
         // vs `systemctl`, guessing at which one would work before finding the one that did.
         // Telling it up front once is strictly cheaper than that trial and error every time.
         os: process.platform,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+        phased: phasedEnabled,
+        filetrack: filetrackOverride,
       },
       config,
       permissions,
@@ -621,6 +648,40 @@ async function main() {
         });
         break;
       }
+      case CLI_MESSAGE_TYPES.TRIAGE_DECIDED:
+        logger.info(msg.role || 'planner', `triaged: mode=${msg.mode || '?'} estLoc=${msg.estimate ?? '?'}`);
+        break;
+      case CLI_MESSAGE_TYPES.DIRECT_MODE_ESCALATED:
+        logger.warning('planner', `direct mode escalated: ${trunc(msg.reason || '')}`);
+        break;
+      case CLI_MESSAGE_TYPES.PHASE_STARTED:
+        logger.info('executor', `phase started: ${msg.phase || '?'} (${msg.index ?? '?'}/${msg.total ?? '?'})`);
+        break;
+      case CLI_MESSAGE_TYPES.PHASE_SUCCESS:
+        logger.info('executor', `phase success: ${msg.phase || '?'} (${msg.durationMs ?? '?'}ms)`);
+        break;
+      case CLI_MESSAGE_TYPES.PHASE_FAILED:
+        logger.error('executor', `phase failed: ${msg.phase || '?'} after ${msg.attempts ?? '?'} attempt(s): ${trunc(msg.traceback || '')}`);
+        break;
+      case CLI_MESSAGE_TYPES.ATTENTION_PING:
+        logger.warning('planner', `attention: ${trunc(JSON.stringify(msg.item || {}))}`);
+        break;
+      case CLI_MESSAGE_TYPES.MIGRATED:
+      case CLI_MESSAGE_TYPES.BRAIN_MIGRATED:
+        logger.info(msg.role, `migrated ${msg.role || '?'} (${msg.reason || '?'}, ${msg.mode || '?'} bundle, ${msg.bundleChars ?? '?'} chars)`);
+        break;
+      case CLI_MESSAGE_TYPES.BUNDLE_TOO_LARGE:
+        logger.warning(null, `bundle too large: ${msg.chars ?? '?'} chars (threshold ${msg.threshold ?? '?'})`);
+        break;
+      case CLI_MESSAGE_TYPES.EXCLUSION_ROUND_STARTED:
+        logger.info(null, 'exclusion round started');
+        break;
+      case CLI_MESSAGE_TYPES.EXCLUSION_ROUND_DONE:
+        logger.info(null, `exclusion round ${msg.round ?? '?'} done: ${msg.chars ?? '?'} chars${msg.stillTooLarge ? ' (still too large)' : ''}`);
+        break;
+      case CLI_MESSAGE_TYPES.RATE_LIMIT_DETECTED:
+        logger.warning(msg.role || null, 'rate limit detected');
+        break;
       default:
         break;
     }
@@ -760,6 +821,52 @@ async function main() {
         cleanupAndExit(0, msg.closed ? 'Session closed and forgotten.' : msg.reason || 'Nothing to close.');
         break;
 
+      case CLI_MESSAGE_TYPES.TRIAGE_DECIDED:
+        ui.info(`Triaged: mode=${msg.mode || '?'}, est. ${msg.estimate ?? '?'} LOC`);
+        break;
+
+      case CLI_MESSAGE_TYPES.DIRECT_MODE_ESCALATED:
+        ui.escalated(msg.reason || 'direct mode failed', msg.filesTouched || []);
+        break;
+
+      case CLI_MESSAGE_TYPES.PHASE_STARTED:
+        ui.phaseStarted(msg.phase || '?', msg.index ?? 0, msg.total ?? 0);
+        break;
+
+      case CLI_MESSAGE_TYPES.PHASE_SUCCESS:
+        ui.phaseSuccess(msg.phase || '?', msg.durationMs ?? 0, msg.filesTouched || []);
+        break;
+
+      case CLI_MESSAGE_TYPES.PHASE_FAILED:
+        ui.phaseFailed(msg.phase || '?', msg.attempts ?? 0, msg.traceback || '');
+        break;
+
+      case CLI_MESSAGE_TYPES.ATTENTION_PING:
+        ui.attentionItem(msg.item || {});
+        break;
+
+      case CLI_MESSAGE_TYPES.MIGRATED:
+      case CLI_MESSAGE_TYPES.BRAIN_MIGRATED:
+        ui.migrated(msg.role || '?', msg.reason || '?', msg.mode || '?', msg.bundleChars ?? 0);
+        break;
+
+      case CLI_MESSAGE_TYPES.BUNDLE_TOO_LARGE:
+        ui.bundleTooLarge(msg.chars ?? 0, msg.threshold ?? 0);
+        break;
+
+      case CLI_MESSAGE_TYPES.EXCLUSION_ROUND_STARTED:
+        ui.exclusionRoundStarted();
+        break;
+
+      case CLI_MESSAGE_TYPES.EXCLUSION_ROUND_DONE:
+        ui.exclusionRoundDone(msg.round ?? 0, msg.chars ?? 0, !!msg.stillTooLarge);
+        break;
+
+      case CLI_MESSAGE_TYPES.RATE_LIMIT_DETECTED:
+        if (msg.retryAt) ui.rateLimitCountdown(msg.role, msg.retryAt, msg.attempt, msg.maxRetries);
+        else ui.warn('Rate limit detected — backing off before migration.');
+        break;
+
       default:
         if (opts.verbose) ui.debug(`Unhandled message type: ${msg.type}`);
     }
@@ -802,7 +909,7 @@ async function main() {
   }
 
   if (task) {
-    sendTask(task, { resume: !!opts.resume });
+    sendTask(task, { resume: !!(opts.resume || opts.continue) });
   } else {
     // Preparation (server start, extension connect) already happened above — this is the
     // "ready and waiting" state, same as after any task completes. The box itself was

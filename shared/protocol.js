@@ -20,27 +20,20 @@ const CLI_MESSAGE_TYPES = {
   SESSION_CLOSED: 'session_closed',
   USER_QUESTION_REQUIRED: 'user_question_required',
   ANSWER_USER_QUESTION: 'answer_user_question',
-  // Sent by the CLI on shutdown (graceful exit only — SIGKILL/Stop-Process -Force can't run
-  // exit handlers, so this is best-effort, not guaranteed) so the orchestrator stops an
-  // in-flight task instead of continuing to poll a tab no CLI is listening to anymore.
-  // Observed live (2026-08-14): killing the CLI process only drops the WebSocket — the
-  // orchestrator's own await chain (waiting on a DeepSeek tab reply) has no idea the CLI is
-  // gone and keeps running; when it finally resolves (which can take many minutes), it
-  // delivers that stale result to whatever CLI happens to be connected next, corrupting the
-  // new session's state (e.g. re-triggering an old, now-unanswerable ASK_USER). CANCEL_TASK
-  // marks the session so sendAndTrack short-circuits before starting another turn AND
-  // suppresses any further NativeBridge.sendToCli for that taskId — see orchestrator.js's
-  // cancelTask/notifyCli. cli/index.js's own taskId filter on incoming messages is the
-  // second, always-on layer of defense for exactly the force-kill case this can't cover.
   CANCEL_TASK: 'cancel_task',
-  // Diagnostic-only, --verbose-only (the CLI dumps every incoming message type under
-  // --verbose with no per-type wiring needed — see cli/index.js's `<- ${JSON.stringify(msg)}`
-  // — so this needed no CLI changes at all). Emitted around the two round trips that can
-  // actually take real wall-clock time: a tab's reply (DeepSeek's own generation time, plus
-  // our send/detect overhead) and a single tool call's native-host execution. Lets a slow
-  // turn be attributed to "DeepSeek is slow to reply" vs. "a tool call/hook/gate is slow"
-  // instead of guessing.
   TIMING: 'timing',
+  TRIAGE_DECIDED: 'triage_decided',
+  DIRECT_MODE_ESCALATED: 'direct_mode_escalated',
+  PHASE_STARTED: 'phase_started',
+  PHASE_SUCCESS: 'phase_success',
+  PHASE_FAILED: 'phase_failed',
+  ATTENTION_PING: 'attention_ping',
+  MIGRATED: 'migrated',
+  BRAIN_MIGRATED: 'brain_migrated',
+  BUNDLE_TOO_LARGE: 'bundle_too_large',
+  EXCLUSION_ROUND_STARTED: 'exclusion_round_started',
+  EXCLUSION_ROUND_DONE: 'exclusion_round_done',
+  RATE_LIMIT_DETECTED: 'rate_limit_detected',
 };
 
 const HOST_MESSAGE_TYPES = {
@@ -48,16 +41,6 @@ const HOST_MESSAGE_TYPES = {
   EXT_TO_CLI: 'ext_to_cli',
   EXEC_TOOL: 'exec_tool',
   TOOL_RESULT: 'tool_result',
-  // Handshake, sent directly over the raw CLI<->native-host WebSocket (never forwarded to
-  // the extension) — see cli/lib/server.js's waitForConnection. Exists because a WebSocket
-  // server bound to a well-known local port can be connected to by ANY process on the
-  // machine that happens to try that same port number, not just this project's own native
-  // host — observed live (2026-08-13): an unrelated project on the same machine, built from
-  // the same template, blindly attempted this exact default port with no discovery-file
-  // involved at all, so scoping the discovery file (also fixed, see PORT_FILE) doesn't by
-  // itself rule this out. HELLO carries a random per-session token; only a connection that
-  // echoes it back via HELLO_ACK is trusted as the real native host — anything else is
-  // closed and the CLI keeps waiting for the next connection attempt instead.
   HELLO: 'hello',
   HELLO_ACK: 'hello_ack',
 };
@@ -79,24 +62,19 @@ const TOOLS = {
   PROC_LIST: 'PROC_LIST',
   PROC_LOG: 'PROC_LOG',
   PROC_KILL: 'PROC_KILL',
-  // Internal only — deliberately never added to toolCalls.js's parsing regex, so no chat
-  // text (however the model formats it) can ever trigger one; only orchestrator.js's own
-  // lifecycle-hook call sites invoke this, via NativeBridge.execTool directly.
   RUN_HOOK: 'RUN_HOOK',
-  // Internal only, same reasoning as RUN_HOOK — never parsed from chat text.
   HASH_TREE: 'HASH_TREE',
-  // Internal only, same reasoning as RUN_HOOK — the orchestrator maintains the task list
-  // automatically from the [SUBTASK] lifecycle it already tracks, rather than relying on the
-  // model to remember a bookkeeping tool call every time (see readme.md section 8).
   TASK_UPSERT: 'TASK_UPSERT',
   TASK_LIST: 'TASK_LIST',
   LOAD_RULES: 'LOAD_RULES',
   LOAD_EXTERNAL_TOOLS: 'LOAD_EXTERNAL_TOOLS',
-  // Internal only, same reasoning as RUN_HOOK/HASH_TREE — native-host is the only place
-  // that actually knows which shell resolvePersistentShell() picked (bash vs cmd.exe) for
-  // THIS machine; orchestrator.js (browser context, no OS/child_process access at all)
-  // would otherwise just be guessing at it from process.platform alone.
   ENV_INFO: 'ENV_INFO',
+  FILETRACK_SCAN: 'FILETRACK_SCAN',
+  INSPECT_TAB: 'INSPECT_TAB',
+  RESOLVE_IMAGE: 'RESOLVE_IMAGE',
+  READ_IMAGE_CHUNK: 'READ_IMAGE_CHUNK',
+  ATTACH_IMAGE: 'ATTACH_IMAGE',
+  COMPILE_BUNDLE: 'COMPILE_BUNDLE',
 };
 
 const DEFAULT_CONFIG = {
@@ -108,6 +86,25 @@ const DEFAULT_CONFIG = {
     actionDelay: [200, 800],
     minMessageInterval: 2000,
     maxMessageInterval: 5000,
+  },
+  phased: {
+    enabled: true,
+    maxDirectLoc: 10000,
+    targetLocPerPhase: 2000,
+    phasesPerBrainPing: 3,
+    apyMaxFixAttempts: 3,
+    maxEscalationCycles: 2,
+    bundleCharLimit: 2400000,
+    targetedBundleMaxChars: 300000,
+    exclusionRoundsMax: 3,
+    rateLimitBackoffMs: [30000, 60000, 120000],
+    postContinueGraceMs: 8000,
+    brainMaxResponseChars: 10000,
+  },
+  filetrack: {
+    enabled: false,
+    bulkThreshold: 100,
+    verbose: false,
   },
 };
 

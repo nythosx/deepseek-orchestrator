@@ -1,0 +1,11 @@
+{
+  "description": "PLACEHOLDER: brain-migration test scenario. Not used by test/e2e-phased-brain-migration.js (that test SKIPs because fake-backend can't simulate a real 429 without extra setup). Included here as reference data for a future real-backend run.",
+  "planner": [
+    "[PHASED] [EST_LOC 3000] [EST_PHASES 2]\n[PHASE name=\"p1\" files=\"p1.txt\"]\n  goal: Create p1.txt\n  tests: verify\n[/PHASE]\n[PHASE name=\"p2\" files=\"p2.txt\"]\n  goal: Create p2.txt\n  tests: verify\n[/PHASE]",
+    "[CONTINUE]"
+  ],
+  "executor": [
+    "```python\nfrom pathlib import Path\nPath('p1.txt').write_text('p1')\nprint('__PHASE_WROTE__ p1.txt')\nprint('__PHASE_SUCCESS__')\n```",
+    "```python\nfrom pathlib import Path\nPath('p2.txt').write_text('p2')\nprint('__PHASE_WROTE__ p2.txt')\nprint('__PHASE_SUCCESS__')\n```"
+  ]
+}

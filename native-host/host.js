@@ -9,6 +9,7 @@ const WebSocket = require('ws');
 
 const { NativeMessaging } = require('./lib/native-messaging');
 const tools = require('./lib/tools');
+const images = require('./lib/images');
 const persistentShell = require('./lib/persistentShell');
 const { HOST_MESSAGE_TYPES, CLI_MESSAGE_TYPES, TOOLS } = require('../shared/protocol');
 
@@ -39,6 +40,11 @@ const pendingApprovals = new Map();
 
 let ws = null;
 let wsQueue = [];
+// Populated by the extension's PROFILE_ID message (see background.js's ensureProfileId /
+// NativeBridge.sendProfileId). Included in every HELLO_ACK from here on. Null on the very
+// first handshake if the extension hasn't sent the ID yet — cli/lib/server.js tolerates
+// that (it attaches whatever arrives, or null), so a race here can't break a run.
+let currentProfileId = null;
 
 function sendToCli(payload) {
   const json = JSON.stringify(payload);
@@ -95,7 +101,13 @@ function connectToCli(port) {
     // some unrelated process that happened to connect to the same well-known local port.
     // Never forwarded into handleCliPayload — it's not a real orchestration message.
     if (payload.type === HOST_MESSAGE_TYPES.HELLO) {
-      ws.send(JSON.stringify({ type: HOST_MESSAGE_TYPES.HELLO_ACK, token: payload.token }));
+      ws.send(
+        JSON.stringify({
+          type: HOST_MESSAGE_TYPES.HELLO_ACK,
+          token: payload.token,
+          profileId: currentProfileId,
+        })
+      );
       return;
     }
     handleCliPayload(payload);
@@ -317,6 +329,13 @@ async function execTool(taskId, tool, params) {
       // Read-only network check (like GREP/LS) — no approval gate.
       return tools.httpGet(projectRoot, params);
 
+    case TOOLS.RESOLVE_IMAGE:
+      // Read-only (writes only to its own temp dir for clipboard/URL images) — no gate.
+      return images.resolveImage(projectRoot, params);
+
+    case TOOLS.READ_IMAGE_CHUNK:
+      return images.readImageChunk(projectRoot, params);
+
     case TOOLS.RUN_HOOK:
       // User-configured (config.json), not model-issued — never gated behind approval.
       return tools.runHook(projectRoot, params);
@@ -326,6 +345,9 @@ async function execTool(taskId, tool, params) {
 
     case TOOLS.ENV_INFO:
       return tools.envInfo();
+
+    case TOOLS.FILETRACK_SCAN:
+      return tools.filetrackScan(projectRoot, params);
 
     case TOOLS.TASK_UPSERT:
       return tools.upsertTask(projectRoot, params);
@@ -348,6 +370,12 @@ async function execTool(taskId, tool, params) {
 }
 
 nm.on('message', async (msg) => {
+  if (msg.type === 'PROFILE_ID') {
+    currentProfileId = msg.profileId || null;
+    log('Profile ID received:', currentProfileId);
+    return;
+  }
+
   if (msg.type === HOST_MESSAGE_TYPES.EXEC_TOOL) {
     try {
       const result = await execTool(msg.taskId, msg.tool, msg.params || {});
@@ -384,6 +412,12 @@ nm.on('close', () => {
 });
 
 nm.on('error', (err) => log('Native messaging error:', err.message));
+
+// A stray throw in any handler would otherwise kill this process, which drops the
+// extension's native port — failing every in-flight tool call and letting Chrome suspend
+// the service worker (see NativeBridge's reconnect comment). Log and keep serving instead.
+process.on('uncaughtException', (err) => log('Uncaught exception:', (err && err.stack) || err));
+process.on('unhandledRejection', (err) => log('Unhandled rejection:', (err && err.stack) || err));
 
 log('Native host started, pid', process.pid);
 pollForCli();

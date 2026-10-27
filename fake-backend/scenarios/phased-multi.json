@@ -1,0 +1,12 @@
+{
+  "description": "Phased mode: triage returns [PHASED] with 3 phases, each phase creates a file, batch ping returns [CONTINUE]",
+  "planner": [
+    "[PHASED] [EST_LOC 5000] [EST_PHASES 3]\n[PHASE name=\"create-hello\" files=\"hello.txt\"]\n  goal: Create hello.txt with 'Hello'\n  tests: verify hello.txt exists\n[/PHASE]\n[PHASE name=\"create-world\" files=\"world.txt\"]\n  goal: Create world.txt with 'World'\n  tests: verify world.txt exists\n[/PHASE]\n[PHASE name=\"verify\" files=\"verify.txt\"]\n  goal: Create verify.txt confirming both files\n  tests: verify verify.txt exists\n[/PHASE]",
+    "[CONTINUE]"
+  ],
+  "executor": [
+    "```python\nfrom pathlib import Path\nPath('hello.txt').write_text('Hello\\n')\nprint('__PHASE_WROTE__ hello.txt')\nassert Path('hello.txt').exists()\nprint('__PHASE_SUCCESS__')\n```",
+    "```python\nfrom pathlib import Path\nPath('world.txt').write_text('World\\n')\nprint('__PHASE_WROTE__ world.txt')\nassert Path('world.txt').exists()\nprint('__PHASE_SUCCESS__')\n```",
+    "```python\nfrom pathlib import Path\nassert Path('hello.txt').exists()\nassert Path('world.txt').exists()\nPath('verify.txt').write_text('Both files exist\\n')\nprint('__PHASE_WROTE__ verify.txt')\nprint('__PHASE_SUCCESS__')\n```"
+  ]
+}

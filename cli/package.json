@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Free AI coding agent CLI — orchestrates a DeepSeek-chat-driven planner/executor loop via a Chrome extension and native host",
   "bin": {
-    "my-claude-code": "./index.js"
+    "deeper": "./index.js"
   },
   "main": "index.js",
   "dependencies": {

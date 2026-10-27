@@ -20,7 +20,14 @@ function ensureProjectConfig(configDir) {
     fs.writeFileSync(memoryPath, '# Project Memory\n\n(No entries yet.)\n');
   }
 
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const rawConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const config = {
+    ...DEFAULT_CONFIG,
+    ...rawConfig,
+    phased: { ...DEFAULT_CONFIG.phased, ...((rawConfig && rawConfig.phased) || {}) },
+    filetrack: { ...DEFAULT_CONFIG.filetrack, ...((rawConfig && rawConfig.filetrack) || {}) },
+    stealth: { ...DEFAULT_CONFIG.stealth, ...((rawConfig && rawConfig.stealth) || {}) },
+  };
   const permissions = JSON.parse(fs.readFileSync(permissionsPath, 'utf8'));
   return { configDir, configPath, permissionsPath, memoryPath, config, permissions };
 }

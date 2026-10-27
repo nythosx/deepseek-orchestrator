@@ -9,12 +9,12 @@ const ToolCallParser = (() => {
   // corrupting real files with garbage. Missing a real call (handled by the
   // near-miss nudge below) is a far safer failure mode than executing invented
   // text as if it were a genuine instruction.
-  const TOOL_LINE_RE = /^!(\s*)?(READ_FILE|WRITE_FILE|SHELL|GREP|FIND_FILE|LS|SEARCH_WEB|ASK_USER|DELETE_FILE|OPEN_APP|HTTP_GET|EDIT_FILE|SHELL_BG|PROC_LIST|PROC_LOG|PROC_KILL|CALL_[A-Za-z0-9_]+)\b[ \t]*(.*)$/;
+  const TOOL_LINE_RE = /^!(\s*)?(READ_FILE|WRITE_FILE|SHELL|GREP|FIND_FILE|LS|SEARCH_WEB|ASK_USER|DELETE_FILE|OPEN_APP|HTTP_GET|EDIT_FILE|SHELL_BG|PROC_LIST|PROC_LOG|PROC_KILL|INSPECT_TAB|ATTACH_IMAGE|COMPILE_BUNDLE|CALL_[A-Za-z0-9_]+)\b[ \t]*(.*)$/;
 
   // Loose, unanchored check used only to detect "the model clearly meant to invoke
   // a tool but didn't format it as its own line" so we can nudge for a retry,
   // never to actually execute anything.
-  const TOOL_MENTION_RE = /!(READ_FILE|WRITE_FILE|SHELL|GREP|FIND_FILE|LS|SEARCH_WEB|ASK_USER|DELETE_FILE|OPEN_APP|HTTP_GET|EDIT_FILE|SHELL_BG|PROC_LIST|PROC_LOG|PROC_KILL|CALL_[A-Za-z0-9_]+)\b/;
+  const TOOL_MENTION_RE = /!(READ_FILE|WRITE_FILE|SHELL|GREP|FIND_FILE|LS|SEARCH_WEB|ASK_USER|DELETE_FILE|OPEN_APP|HTTP_GET|EDIT_FILE|SHELL_BG|PROC_LIST|PROC_LOG|PROC_KILL|INSPECT_TAB|ATTACH_IMAGE|COMPILE_BUNDLE|CALL_[A-Za-z0-9_]+)\b/;
 
   // Observed live: several intended-to-be-separate "!TOOL arg" lines can arrive as a single
   // line with no real newline between them (e.g. the chat UI's response text collapsing a
@@ -26,7 +26,7 @@ const ToolCallParser = (() => {
   // another tool marker is almost certainly this corruption, not a real path/command, so it
   // gets filtered out of the executable calls and reported back as a specific parse failure
   // instead (see hasCorruptedToolCall / orchestrator.js).
-  const EMBEDDED_TOOL_RE = /!(READ_FILE|WRITE_FILE|SHELL|GREP|FIND_FILE|LS|SEARCH_WEB|ASK_USER|DELETE_FILE|OPEN_APP|HTTP_GET|EDIT_FILE|SHELL_BG|PROC_LIST|PROC_LOG|PROC_KILL|CALL_[A-Za-z0-9_]+)\b/;
+  const EMBEDDED_TOOL_RE = /!(READ_FILE|WRITE_FILE|SHELL|GREP|FIND_FILE|LS|SEARCH_WEB|ASK_USER|DELETE_FILE|OPEN_APP|HTTP_GET|EDIT_FILE|SHELL_BG|PROC_LIST|PROC_LOG|PROC_KILL|INSPECT_TAB|ATTACH_IMAGE|COMPILE_BUNDLE|CALL_[A-Za-z0-9_]+)\b/;
 
   // WRITE_FILE's `content` and GREP's `pattern` are the two params deliberately meant to
   // hold arbitrary free-form text chosen by the model — genuinely writing documentation
@@ -40,6 +40,7 @@ const ToolCallParser = (() => {
     WRITE_FILE: new Set(['content']),
     GREP: new Set(['pattern']),
     EDIT_FILE: new Set(['oldString', 'newString']),
+    COMPILE_BUNDLE: new Set(['script']),
   };
 
   function looksCorrupted(call) {
@@ -303,6 +304,18 @@ const ToolCallParser = (() => {
         calls.push({ tool, params: { id, lines: linesArg ? Number(linesArg) : undefined } });
       } else if (tool === 'PROC_KILL') {
         calls.push({ tool, params: { id: rest.trim() } });
+      } else if (tool === 'INSPECT_TAB') {
+        calls.push({ tool, params: { url: rest.trim() } });
+      } else if (tool === 'COMPILE_BUNDLE') {
+        const list = rest.trim();
+        const parts = (list.includes(',') ? list.split(',') : list.split(/\s+/))
+          .map((p) => p.trim().replace(/^["']|["']$/g, ''))
+          .filter(Boolean);
+        calls.push({ tool, params: { paths: parts } });
+      } else if (tool === 'ATTACH_IMAGE') {
+        // Path, file name, URL or [Image] -- may contain spaces, so the whole rest of the
+        // line is the reference (surrounding quotes are stripped host-side).
+        calls.push({ tool, params: { ref: rest.trim() } });
       } else if (tool.startsWith('CALL_')) {
         // !CALL_<NAME> arg1 arg2 ... — declarative external tools (.myclaudecode/tools.json,
         // see orchestrator.js). Unlike every other tool here, the set of valid names isn't
@@ -317,8 +330,17 @@ const ToolCallParser = (() => {
   }
 
   // Public entry point — only ever returns calls safe to actually execute.
+  function attachCompileScript(text, calls) {
+    const compile = calls.find((c) => c.tool === 'COMPILE_BUNDLE' && !(c.params.paths || []).length);
+    if (!compile) return calls;
+    const after = text.slice(Math.max(0, text.search(/^!\s*COMPILE_BUNDLE\b/m)));
+    const block = /```[^\n`]*\r?\n([\s\S]*?)```/.exec(after);
+    if (block) compile.params.script = block[1];
+    return calls;
+  }
+
   function parseToolCalls(text) {
-    return parseToolCallsRaw(text).filter((c) => !looksCorrupted(c));
+    return attachCompileScript(text, parseToolCallsRaw(text)).filter((c) => !looksCorrupted(c));
   }
 
   // True if the raw text contained at least one call that parseToolCalls silently dropped

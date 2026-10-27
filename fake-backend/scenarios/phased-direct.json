@@ -1,0 +1,9 @@
+{
+  "description": "Direct mode: triage returns [DIRECT] + brief, coder returns a working a.py that creates hello.txt",
+  "planner": [
+    "[DIRECT] [EST_LOC 50]\n[BRIEF]\n  files_to_touch: hello.txt\n  changes:\n    - hello.txt: create with 'Hello World'\n  tests: verify hello.txt exists\n  risks: none\n[/BRIEF]"
+  ],
+  "executor": [
+    "```python\nfrom pathlib import Path\np = Path('hello.txt')\np.write_text('Hello World\\n')\nprint('__PHASE_WROTE__ hello.txt')\nassert p.exists()\nprint('__PHASE_SUCCESS__')\n```"
+  ]
+}
